@@ -1626,7 +1626,7 @@ def test_docstrings():
 if __name__ == '__main__':
     # test_func()
     # test_smoothing_spline()
-    # compare_methods()
-    # demo_monoticity()
+    compare_methods()
+    #demo_monoticity()
     # test_interp3()
-    test_docstrings()
+    #test_docstrings()
