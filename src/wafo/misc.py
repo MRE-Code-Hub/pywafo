@@ -8,25 +8,18 @@ import numbers
 import sys
 import warnings
 from time import strftime, gmtime
-try:
-    from typing import Callable
-except ImportError:
-    from collections import Callable
-
 import numpy as np
 from numpy import (sqrt, arctan2, sin, cos, exp, log, log1p,
-                   inf, pi, zeros, ones, meshgrid)
+                   inf, pi, zeros, ones, meshgrid, ndarray)
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy.special import gammaln, betaln  # pylint: disable=no-name-in-module
-from scipy.integrate import trapz, simps
+from scipy.integrate import trapezoid, simpson
 
-from wafo import _misc_numba
+
 from wafo.plotbackend import plotbackend as plt
+from wafo._misc_numba import findrfc, findcross, findexrema
+from wafo._nieslony_numba import findrfc_astm
 
-try:
-    from wafo import c_library as clib  # @UnresolvedImport
-except ImportError:
-    warnings.warn('c_library not found. Check its compilation.')
-    clib = None
 
 FLOATINFO = np.finfo(float)
 _tiny_name = 'tiny' if np.__version__ < '1.22' else 'smallest_normal'
@@ -34,9 +27,9 @@ _TINY = getattr(FLOATINFO, _tiny_name)
 _EPS = FLOATINFO.eps
 
 __all__ = ['now', 'spaceline', 'narg_smallest', 'args_flat', 'is_numlike',
-           'JITImport', 'DotDict', 'Bunch', 'printf', 'sub_dict_select',
-           'parse_kwargs', 'detrendma', 'ecross', 'findcross', 'findextrema',
-           'findpeaks', 'findrfc', 'rfcfilter', 'findtp', 'findtc',
+           'JITImport', 'printf',
+            'detrendma', 'ecross', 'findcross', 'findextrema',
+           'findpeaks', 'findrfc', 'findtp', 'findtc', findrfc_astm,
            'findoutliers', 'common_shape', 'argsreduce', 'stirlerr',
            'getshipchar',
            'betaloge', 'gravity', 'nextpow2', 'discretize',
@@ -44,10 +37,80 @@ __all__ = ['now', 'spaceline', 'narg_smallest', 'args_flat', 'is_numlike',
            'meshgrid', 'ndgrid', 'trangood', 'tranproc',
            'plot_histgrm', 'num2pistr',
            'lazywhere', 'lazyselect',
-           'valarray', 'lfind',
-           'moving_average',
+           'lfind',
+           'moving_average', 'moving_max', 'moving_median',
            'piecewise',
-           'check_random_state']
+           'check_random_state', 'to_scalar']
+
+
+def to_scalar(x):
+    """Convert 1 element numpy arrays to scalar
+    
+    Notes
+    -----
+    Raises error for multiellement arrays
+
+    Examples
+    --------
+    >>> to_scalar(np.array([1]))
+    1
+    >>> to_scalar(np.array([[2]]))
+    2
+    """
+    if type(x) is ndarray:
+        if x.size == 1:
+            return x.ravel().item()
+        raise ValueError(f"Expected array with 1 element, got {x.size}")
+    return x
+
+
+def around(val, decimals=0):
+    """Evenly round to the given number of decimals
+
+    Parameters
+    ----------
+    val: real scalar or array-like
+
+    Returns
+    -------
+    rval: real scalar or list of real scalars
+
+    Notes
+    -----
+    This function is useful if you want rvals to have exactly n decimals.
+
+    Examples
+    --------
+    >>> around(1.23456789)
+    1
+    >>> around(1.23456789, decimals=2)
+    1.23
+    >>> around(1.23456789, decimals=3)
+    1.235
+    >>> around(1.23456789, decimals=4)
+    1.2346
+    >>> around(1.23456789, decimals=5)
+    1.23457
+    >>> around([1.23456789, 2.23456789])
+    [1, 2]
+    >>> around([1.23456789, 2.23456789], decimals=2)
+    [1.23, 2.23]
+    >>> around([1.23456789, 2.23456789], decimals=3)
+    [1.235, 2.235]
+    >>> around([1.23456789, 2.23456789], decimals=4)
+    [1.2346, 2.2346]
+    >>> around([1.23456789, 2.23456789], decimals=5)
+    [1.23457, 2.23457]
+
+    """
+    if decimals == 0:
+        if np.ndim(val) == 0:
+            return int(np.around(val))
+        return list(int(np.around(v)) for v in val)
+    scale = 10**decimals
+    if np.ndim(val) == 0:
+        return int(np.around(val * scale)) / scale
+    return list(int(np.around(v * scale)) / scale for v in val)
 
 
 def xor(a, b):
@@ -108,7 +171,7 @@ def check_random_state(seed):
     check_random_state(seed=2.5)
     """
     if seed is None or seed is np.random:
-        return np.random.mtrand._rand
+        return np.random.mtrand._rand  # pylint: disable=protected-access
     if isinstance(seed, (numbers.Integral, np.integer)):
         return np.random.RandomState(seed)
     if isinstance(seed, np.random.RandomState):
@@ -117,68 +180,68 @@ def check_random_state(seed):
     raise ValueError(msg.format(seed))
 
 
-def valarray(shape, value=np.nan, typecode=None):
-    """Return an array of all value."""
-    return np.full(shape, fill_value=value, dtype=typecode)
-
-
 def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
     """
     Evaluate a piecewise-defined function.
 
-    Given a set of conditions and corresponding functions, evaluate each
-    function on the input data wherever its condition is true.
+    Given a set of conditions and corresponding functions (or constants),
+    evaluate each function on the input data wherever its condition is true.
+
 
     Parameters
     ----------
     condlist : list of bool arrays
-        Each boolean array corresponds to a function in `funclist`.  Wherever
-        `condlist[i]` is True, `funclist[i](x0,x1,...,xn)` is used as the
-        output value. Each boolean array in `condlist` selects a piece of `xi`,
-        and should therefore be of the same shape as `xi`.
+        Each boolean array corresponds to a function in `funclist`. Wherever
+        `condlist[i]` is True, `funclist[i]` is used to compute the output.
+        All conditions must be broadcastable to the same shape.
 
-        The length of `condlist` must correspond to that of `funclist`.
-        If one extra function is given, i.e. if
-        ``len(funclist) - len(condlist) == 1``, then that extra function
-        is the default value, used wherever all conditions are false.
-    funclist : list of callables, f(*(xi + args), **kw), or scalars
-        Each function is evaluated over `x` wherever its corresponding
-        condition is True.  It should take an array as input and give an array
-        or a scalar value as output.  If, instead of a callable,
-        a scalar is provided then a constant function (``lambda x: scalar``) is
-        assumed.
-    xi : tuple
-        input arguments to the functions in funclist, i.e., (x0, x1,...., xn)
+        If ``len(funclist) == len(condlist) + 1``, the last function in
+        `funclist` is treated as the "otherwise" (default) case and is applied
+        where none of the conditions are True.
+
+    funclist : list of callables or scalars
+        Each element corresponds to a condition in `condlist`. If an element
+        is callable, it is evaluated as:
+            ``f(x0, x1, ..., xn, *args, **kw)``
+        using only the values where the corresponding condition is True.
+
+        If an element is not callable, it is treated as a constant and assigned
+        directly to the output where the condition is True.
+    xi : tuple of array_like, optional
+        Input arrays passed to the functions in `funclist`, i.e., (x0, x1,...., xn).
+        These arrays must be broadcastable to a common shape. If `xi` is a single array, it may
+        be passed directly (it will be converted to a tuple internally).
+
+        If `xi` is None, functions should not expect array inputs.
+
     fillvalue : scalar
-        fillvalue for out of range values. Default 0.
+        Value used to fill elements where no condition is True. Default is 0.0.
+
     args : tuple, optional
-        Any further arguments given here passed to the functions
-        upon execution, i.e., if called ``piecewise(..., ..., args=(1, 'a'))``,
-        then each function is called as ``f(x0, x1,..., xn, 1, 'a')``.
-    kw : dict, optional
-        Keyword arguments used in calling `piecewise` are passed to the
-        functions upon execution, i.e., if called
-        ``piecewise(..., ..., lambda=1)``, then each function is called as
-        ``f(x0, x1,..., xn, lambda=1)``.
+        Additional positional arguments passed to each callable function.
+    **kw : dict, optional
+        Additional keyword arguments passed to each callable function.
 
     Returns
     -------
     out : ndarray
-        The output is the same shape and type as x and is found by
-        calling the functions in `funclist` on the appropriate portions of `x`,
-        as defined by the boolean arrays in `condlist`.  Portions not covered
-        by any condition have undefined values.
-
+        An array with the same shape as the broadcasted inputs. Each element
+        is computed according to the first condition that evaluates to True.
+        Elements not covered by any condition are set to `fillvalue`.
 
     See Also
     --------
-    choose, select, where
+    lazyselect, lazywhere,
 
     Notes
     -----
-    This is similar to choose or select, except that functions are
-    evaluated on elements of `xi` that satisfy the corresponding condition from
-    `condlist`.
+    - Only the necessary elements of `xi` are passed to each function,
+      improving efficiency.
+    - Functions in `funclist` must return values compatible with the number
+      of True elements in their corresponding condition.
+    - This function is similar to `numpy.piecewise` but evaluates functions
+      only on selected elements (lazy evaluation).
+
 
     The result is::
 
@@ -222,51 +285,95 @@ def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
     >>> np.allclose(piecewise([x > 1, x > 3], [1, 3], xi=(x,)), [0, 0, 1, 1, 3])
     True
     """
+    
     def otherwise_condition(condlist):
         return ~np.logical_or.reduce(condlist, axis=0)
 
-    def check_shapes(condlist, funclist):
-        num_cond, num_fun = len(condlist), len(funclist)
-        _assert(num_cond in [num_fun - 1, num_fun],
-                "function list and condition list must be the same length")
+    # Validate lengths
+    num_cond, num_fun = len(condlist), len(funclist)
+    if num_cond not in (num_fun, num_fun - 1):
+        raise ValueError("function list and condition list must match")
 
-    check_shapes(condlist, funclist)
+    # Broadcast conditions
+    condlist = list(np.broadcast_arrays(*condlist))
 
-    condlist = np.broadcast_arrays(*condlist)
+    # Add default condition if needed
     if len(condlist) == len(funclist) - 1:
         condlist.append(otherwise_condition(condlist))
 
+    # Prepare inputs
     if xi is None:
         arrays = ()
-        dtype = np.result_type(*funclist)
         shape = condlist[0].shape
+        dtype = np.result_type(fillvalue)
     else:
         if not isinstance(xi, tuple):
             xi = (xi,)
         arrays = np.broadcast_arrays(*xi)
-        dtype = np.result_type(*arrays)
         shape = arrays[0].shape
+        dtype = np.result_type(*arrays, fillvalue)
 
     out = np.full(shape, fillvalue, dtype)
+
     for cond, func in zip(condlist, funclist):
-        if cond.any():
-            if isinstance(func, Callable):
-                temp = tuple(np.extract(cond, arr) for arr in arrays) + args
-                np.place(out, cond, func(*temp, **kw))
-            else:  # func is a scalar value or a array
-                np.putmask(out, cond, func)
+
+        if not cond.any():
+            continue
+
+        if callable(func):
+            vals = tuple(arr[cond] for arr in arrays) + args
+            np.place(out, cond, func(*vals, **kw))
+        else:
+            np.putmask(out, cond, func)
     return out
 
 
-def lazywhere(cond, arrays, f, fillvalue=None, f2=None):
+def lazywhere(condition, arrays, f, fillvalue=None, f2=None):
     """
-    np.where(cond, x, fillvalue) always evaluates x even where cond is False.
-    This one only evaluates f(arr1[cond], arr2[cond], ...).
-    For example,
+    Lazily evaluate a conditional expression.
+
+    Parameters
+    ----------
+    condition : array-like of bool
+        Boolean mask. Where True, `f(*arrays)` is used; elsewhere either
+        `fillvalue` or `f2(*arrays)` is used.
+
+    arrays : tuple of array_like
+        Input arrays passed to `f` and `f2`. Must be broadcastable to a
+        common shape.
+
+    f : callable
+        Function applied where `condition` is True. Must accept the arrays
+        as positional arguments and return values compatible with the mask.
+
+    fillvalue : scalar, optional
+        Value used where `condition` is False. If not provided, `f2` must be given.
+
+    f2 : callable, optional
+        Function applied where `condition` is False.
+
+    Returns
+    -------
+    out : ndarray
+        Result array with the same shape as the broadcasted inputs.
+
+    Notes
+    -----
+    Equivalent to:
+        np.where(condition, f(*arrays), fillvalue)
+    or:
+        np.where(condition, f(*arrays), f2(*arrays))
+
+    but evaluates `f` and `f2` only where needed.  The functions must 
+    return values compatible with the number of True/False
+    elements in `condition`.
+
+    Examples
+    --------
     >>> a, b = np.array([1, 2, 3, 4]), np.array([5, 6, 7, 8])
     >>> def f(a, b):
     ...     return a*b
-    >>> np.allclose(lazywhere(a > 2, (a, b), f, np.nan),
+    >>> np.allclose(lazywhere(a > 2, (a, b), f, fillvalue=np.nan),
     ...            [np.nan,  np.nan,  21.,  32.], equal_nan=True)
     True
     >>> def f2(a, b):
@@ -274,35 +381,90 @@ def lazywhere(cond, arrays, f, fillvalue=None, f2=None):
     >>> np.allclose(lazywhere(a > 2, (a, b), f, f2=f2), [  25.,  144.,   21.,   32.])
     True
 
-    Notice it assumes that all `arrays` are of the same shape, or can be
-    broadcasted together.
-
     """
-    if fillvalue is None:
-        _assert(f2 is not None, "One of (fillvalue, f2) must be given.")
-        fillvalue = np.nan
-    else:
-        _assert(f2 is None, "Only one of (fillvalue, f2) can be given.")
+    
+    
+    if len(arrays) == 0:
+        raise ValueError("arrays must contain at least one array")
+
+    if fillvalue is None and f2 is None:
+        raise ValueError("One of (fillvalue, f2) must be given.")
+    if fillvalue is not None and f2 is not None:
+        raise ValueError("Only one of (fillvalue, f2) can be given.")
 
     arrays = np.broadcast_arrays(*arrays)
-    temp = tuple(np.extract(cond, arr) for arr in arrays)
-    out = np.full(np.shape(arrays[0]), fill_value=fillvalue)
-    np.place(out, cond, f(*temp))
-    if f2 is not None:
-        temp = tuple(np.extract(~cond, arr) for arr in arrays)
-        np.place(out, ~cond, f2(*temp))
+    condition = np.asarray(condition, dtype=bool)
+    condition = np.broadcast_to(condition, arrays[0].shape)
 
+    shape = arrays[0].shape
+
+    # dtype determination
+    if f2 is None:
+        dtype = np.result_type(*arrays, fillvalue)
+        out = np.full(shape, fillvalue, dtype=dtype)
+    else:
+        dtype = np.result_type(*arrays)
+        out = np.empty(shape, dtype=dtype)
+
+        inv = ~condition
+        if inv.any():
+            vals = tuple(arr[inv] for arr in arrays)
+            np.place(out, inv, f2(*vals))
+
+    if condition.any():
+        vals = tuple(arr[condition] for arr in arrays)
+        np.place(out, condition, f(*vals))
     return out
 
 
-def lazyselect(condlist, choicelist, arrays, default=0):
+def lazyselect(condlist, funclist, arrays, default=0):
     """
-    Mimic `np.select(condlist, choicelist)`.
+    Lazily select from functions based on conditions.
+
+    Similar to `np.select`, but functions are evaluated only on the elements
+    where their corresponding condition is True.
+
+    Parameters
+    ----------
+    condlist : sequence of array_like of bool
+        Conditions determining which function to apply. Later conditions
+        override earlier ones if multiple are True.
+
+    funclist : sequence of callables
+        Functions corresponding to each condition. Each must accept
+        `arrays` as arguments and return values compatible with the mask.
+
+    arrays : tuple of array_like
+        Input arrays, broadcastable to a common shape.
+
+    default : scalar, optional
+        Value used where no conditions are True.
+
+    Returns
+    -------
+    out : ndarray
+        Output array with the same shape as broadcasted inputs.
+
+    Notes
+    -----
+    - Functions are evaluated only on the subset of elements where their
+      condition is True (lazy evaluation).
+    - If multiple conditions are True, the last one takes precedence.
+
+
+    See also
+    --------
+    lazywhere, piecewise
+
+    Notes
+    -----
+    Lazily evaluates the choicelist = [fun(*arrays) for fun in funclist],
+    depending on conditions and returns an array drawn from elements in choicelist,
 
     Notice it assumes that all `arrays` are of the same shape, or can be
     broadcasted together.
 
-    All functions in `choicelist` must accept array arguments in the order
+    All functions in `funclist` must accept array arguments in the order
     given in `arrays` and must return an array of the same shape as broadcasted
     `arrays`.
 
@@ -315,32 +477,64 @@ def lazyselect(condlist, choicelist, arrays, default=0):
     >>> np.allclose(lazyselect([x < 3, x > 3], [lambda x: x**2, lambda x: x**3], (x,)),
     ...             [   0.,    1.,    4.,    0.,   64.,  125.])
     True
+
     >>> a = -np.ones_like(x)
     >>> np.allclose(lazyselect([x < 3, x > 3],
     ...                        [lambda x, a: x**2, lambda x, a: a * x**3],
     ...                        (x, a)),
     ...             [   0.,    1.,    4.,    0.,  -64., -125.])
     True
+
     """
+    
+    if len(condlist) != len(funclist):
+        raise ValueError("condlist and funclist must have the same length")
+    if len(condlist) == 0:
+        raise ValueError("condlist cannot be empty")
+    if len(arrays) == 0:
+        raise ValueError("arrays must contain at least one array")
+
+    # Broadcast arrays
     arrays = np.broadcast_arrays(*arrays)
-    tcode = np.mintypecode([a.dtype.char for a in arrays])
-    out = valarray(np.shape(arrays[0]), value=default, typecode=tcode)
-    for index, cond in enumerate(condlist):
-        func = choicelist[index]
-        if np.all(cond is False):
+
+    # Normalize and broadcast conditions
+    condlist = [np.asarray(cond, dtype=bool) for cond in condlist]
+    condlist = [np.broadcast_to(cond, arrays[0].shape) for cond in condlist]
+
+    # Output dtype
+    dtype = np.result_type(*arrays, default)
+    out = np.full(arrays[0].shape, default, dtype=dtype)
+
+    # Apply functions
+    for cond, func in zip(condlist, funclist):
+        if not cond.any():
             continue
-        cond, _ = np.broadcast_arrays(cond, arrays[0])
-        temp = tuple(np.extract(cond, arr) for arr in arrays)
-        np.place(out, cond, func(*temp))
+
+        vals = tuple(arr[cond] for arr in arrays)
+        np.place(out, cond, func(*vals))
+
     return out
 
 
 def rotation_matrix(heading, pitch, roll):
-    '''
+    """
+    Compute a 3×3 rotation matrix from heading, pitch, and roll (degrees).
+
+    Uses the ZYX (yaw–pitch–roll) convention:
+        R = Rz(heading) @ Ry(pitch) @ Rx(roll)
+
     Parameters
     ----------
-    heading, pitch, roll : real scalars
-        defining heading, pitch and roll in degrees.
+    heading, pitch, roll : float
+        Rotation angles in degrees:
+        - heading (yaw) about z-axis
+        - pitch about y-axis
+        - roll about x-axis
+    
+    Returns
+    -------
+    R : ndarray, shape (3, 3)
+        Rotation matrix
 
     Examples
     --------
@@ -350,6 +544,7 @@ def rotation_matrix(heading, pitch, roll):
     ...        [ 0.,  1.,  0.],
     ...        [ 0.,  0.,  1.]])
     True
+
     >>> np.allclose(rotation_matrix(heading=180, pitch=0, roll=0),
     ...      [[ -1.,   0.,   0.],
     ...       [  0.,  -1.,   0.],
@@ -365,28 +560,45 @@ def rotation_matrix(heading, pitch, roll):
     ...       [ 0.,  -1.,   0.],
     ...       [ 0.,   0.,  -1.]])
     True
-    '''
-    data = np.diag(np.ones(3))  # No transform if H=P=R=0
-    if heading != 0 or pitch != 0 or roll != 0:
-        deg2rad = np.pi / 180
-        rheading = heading * deg2rad
-        rpitch = pitch * deg2rad
-        rroll = roll * deg2rad  # Convert to radians
+    """
+    if heading == 0 and pitch == 0 and roll == 0:        
+        return np.eye(3)  # No transform if H=P=R=0
 
-        data.put(0, cos(rheading) * cos(rpitch))
-        data.put(1, cos(rheading) * sin(rpitch) * sin(rroll) - sin(rheading) * cos(rroll))
-        data.put(2, cos(rheading) * sin(rpitch) * cos(rroll) + sin(rheading) * sin(rroll))
-        data.put(3, sin(rheading) * cos(rpitch))
-        data.put(4, sin(rheading) * sin(rpitch) * sin(rroll) + cos(rheading) * cos(rroll))
-        data.put(5, sin(rheading) * sin(rpitch) * cos(rroll) - cos(rheading) * sin(rroll))
-        data.put(6, -sin(rpitch))
-        data.put(7, cos(rpitch) * sin(rroll))
-        data.put(8, cos(rpitch) * cos(rroll))
-    return data
+    # Convert to radians
+    rheading, rpitch, rroll = np.deg2rad([heading, pitch, roll])    
+    # Trig values
+    cH, sH = cos(rheading), sin(rheading)
+    cP, sP = cos(rpitch), sin(rpitch)
+    cR, sR = cos(rroll), sin(rroll)
+
+    # Rotation matrix (ZYX)
+    return np.array([
+            [cH*cP,  cH*sP*sR - sH*cR,  cH*sP*cR + sH*sR],
+            [sH*cP,  sH*sP*sR + cH*cR,  sH*sP*cR - cH*sR],
+            [-sP,    cP*sR,             cP*cR]
+        ], dtype=float)
 
 
 def rotate(x, y, z, heading=0, pitch=0, roll=0):
     """
+    Rotate 3D coordinates using heading, pitch, and roll angles.
+
+    Uses the same ZYX (yaw–pitch–roll) convention as `rotation_matrix`:
+        R = Rz(heading) @ Ry(pitch) @ Rx(roll)
+
+    Parameters
+    ----------
+    x, y, z : array_like or scalar
+        Coordinates of the points. Must be broadcastable to the same shape.
+
+    heading, pitch, roll : float
+        Rotation angles in degrees.
+
+    Returns
+    -------
+    x_out, y_out, z_out : ndarray or scalar
+        Rotated coordinates with the same shape as inputs.
+
     Examples
     --------
     >>> import numpy as np
@@ -404,6 +616,17 @@ def rotate(x, y, z, heading=0, pitch=0, roll=0):
     ...            (1.0, -1.0, 1.0))
     True
     """
+    
+    R = rotation_matrix(heading, pitch, roll)
+
+    # Stack inputs (supports scalars + arrays)
+    v = np.stack((x, y, z), axis=0)
+
+    # Apply rotation
+    result = R @ v
+
+    return result[0], result[1], result[2]
+
     rot_param = rotation_matrix(heading, pitch, roll).ravel()
     x_out = x * rot_param[0] + y * rot_param[1] + z * rot_param[2]
     y_out = x * rot_param[3] + y * rot_param[4] + z * rot_param[5]
@@ -412,8 +635,21 @@ def rotate(x, y, z, heading=0, pitch=0, roll=0):
 
 
 def rotate_2d(x, y, angle_deg):
-    '''
-    Rotate points in the xy cartesian plane counter clockwise
+    """
+    Rotate points in the xy plane counter clockwise.
+
+    Parameters
+    ----------
+    x, y : array_like or scalar
+        Coordinates of the points. Must be broadcastable.
+
+    angle_deg : float
+        Rotation angle in degrees (counterclockwise).
+
+    Returns
+    -------
+    x_out, y_out : ndarray or scalar
+        Rotated coordinates.
 
     Examples
     --------
@@ -425,8 +661,8 @@ def rotate_2d(x, y, angle_deg):
     True
     >>> np.allclose(rotate_2d(x=1, y=0, angle_deg=360), (1.0, 0))
     True
-    '''
-    angle_rad = angle_deg * pi / 180
+    """
+    angle_rad = np.deg2rad(angle_deg)
     cos_a = cos(angle_rad)
     sin_a = sin(angle_rad)
     return cos_a * x - sin_a * y, sin_a * x + cos_a * y
@@ -447,7 +683,7 @@ def _assert(cond, txt=''):
 
 
 def spaceline(start_point, stop_point, num=10):
-    '''Return `num` evenly spaced points between the start and stop points.
+    '''Return `num` evenly spaced points between start and stop.
 
     Parameters
     ----------
@@ -473,36 +709,64 @@ def spaceline(start_point, stop_point, num=10):
 
     Examples
     --------
-    >>> import wafo.misc as pm
-    >>> np.allclose(pm.spaceline((2,0,0), (3,0,0), num=5),
+    >>> import wafo.misc as wm
+    >>> np.allclose(wm.spaceline((2,0,0), (3,0,0), num=5),
     ...      [[ 2.  ,  0.  ,  0.  ],
     ...       [ 2.25,  0.  ,  0.  ],
     ...       [ 2.5 ,  0.  ,  0.  ],
     ...       [ 2.75,  0.  ,  0.  ],
     ...       [ 3.  ,  0.  ,  0.  ]])
     True
-    >>> np.allclose(pm.spaceline((2,0,0), (0,0,3), num=5),
+    >>> np.allclose(wm.spaceline((2,0,0), (0,0,3), num=5),
     ...      [[ 2.  ,  0.  ,  0.  ],
     ...       [ 1.5 ,  0.  ,  0.75],
     ...       [ 1.  ,  0.  ,  1.5 ],
     ...       [ 0.5 ,  0.  ,  2.25],
     ...       [ 0.  ,  0.  ,  3.  ]])
     True
-    >>> np.allclose(pm.spaceline((2,0,0), (0,0,3), num=1),
+    >>> np.allclose(wm.spaceline((2,0,0), (0,0,3), num=1),
     ...      [[ 1.  ,  0.  ,  1.5 ]])
     True
     '''
+
     num = int(num)
-    start, stop = np.atleast_1d(start_point, stop_point)
-    if num > 1:
-        delta = (stop - start) / float(num - 1)
-        return np.array([start + n * delta for n in range(num)])
-    delta = (stop - start) / 2.0
-    return np.array([start + delta])
+    if num <= 0:
+        raise ValueError("num must be positive")
+    
+    start = np.asarray(start_point)
+    stop  = np.asarray(stop_point)
+    dtype = np.result_type(start, stop, float)
+
+    start = start.astype(dtype, copy=False)
+    stop  = stop.astype(dtype, copy=False)
+
+
+    if start.shape != stop.shape:
+        raise ValueError("start_point and stop_point must have the same shape")
+    
+    # Special case: midpoint
+    if num == 1:
+        return ((start + stop) / 2)[None, :]
+
+    # Vectorized interpolation
+    t = np.linspace(0, 1, num)[:, None]
+    return start + t * (stop - start)
 
 
 def narg_smallest(arr, n=1):
     ''' Return the n smallest indices to the arr
+
+    Parameters
+    ----------
+    arr : array_like
+        Input array.
+    n : int, optional
+        Number of smallest elements to return (default 1).
+
+    Returns
+    -------
+    indices : ndarray of int
+        Indices of the n smallest elements (sorted by value).
 
     Examples
     --------
@@ -515,7 +779,17 @@ def narg_smallest(arr, n=1):
     >>> np.allclose(t[ix], [0, 2, 3])
     True
     '''
-    return np.array(arr).argsort()[:n]
+
+    arr = np.asarray(arr).ravel()
+    n = int(n)
+
+    if n <= 0:
+        return np.array([], dtype=int)
+
+    n = min(n, arr.size)
+
+    ix = np.argpartition(arr, n - 1)[:n]
+    return ix[np.argsort(arr[ix])]
 
 
 def args_flat(*args):
@@ -524,19 +798,19 @@ def args_flat(*args):
 
     Parameters
     ----------
-    pos : array-like, shape N x 3
-        [x,y,z] positions
+    pos : array_like, shape (N, 3)
+        Positions as rows [x, y, z].
     or
-
-    x,y,z : array-like
-        [x,y,z] positions
+    x, y, z : array_like
+        Coordinate arrays (broadcastable to same shape).
 
     Returns
     ------
     pos : ndarray, shape N x 3
-        [x,y,z] positions
+        Flattened positions.
     common_shape : None or tuple
-        common shape of x, y and z variables if given as triple input.
+        Shape of broadcasted inputs (if x, y, z given),
+        or None if pos was given.
 
     Examples
     --------
@@ -566,113 +840,195 @@ def args_flat(*args):
 
     '''
     nargin = len(args)
-    _assert(nargin in [1, 3], 'Number of arguments must be 1 or 3!')
-    if nargin == 1:  # pos
-        pos = np.atleast_2d(args[0])
-        _assert((pos.shape[1] == 3) and (pos.ndim == 2),
-                'POS array must be of shape N x 3!')
+
+    if nargin not in (1, 3):
+        raise ValueError("Number of arguments must be 1 or 3")
+
+    # Case 1: single (N,3) input
+    if nargin == 1:  
+        
+        pos = np.asarray(args[0])
+
+        if pos.ndim == 1:
+            if pos.size != 3:
+                raise ValueError("Single point must have length 3")
+            pos = pos[None, :]
+        elif pos.ndim == 2:
+            if pos.shape[1] != 3:
+                raise ValueError("POS array must be shape (N, 3)")
+        else:
+            raise ValueError("Invalid shape for POS")
+
         return pos, None
 
+    # Case 2: x, y, z inputs
     x, y, z = np.broadcast_arrays(*args[:3])
     c_shape = x.shape
-    return np.vstack((x.ravel(), y.ravel(), z.ravel())).T, c_shape
+    return np.column_stack((x.ravel(), y.ravel(), z.ravel())), c_shape
 
 
 def index2sub(shape, index, order='C'):
-    '''
-    Returns Multiple subscripts from linear index.
+    """
+    
+    Convert linear indices to subscripts.
 
     Parameters
     ----------
-    shape : array-like
-        shape of array
-    index :
-        linear index into array
-    order : {'C','F'}, optional
-        The order of the linear index.
-        'C' means C (row-major) order.
-        'F' means Fortran (column-major) order.
-        By default, 'C' order is used.
+    shape : tuple of ints
+        Shape of the array.
 
-    This function is used to determine the equivalent subscript values
-    corresponding to a given single index into an array.
+    index : int or array_like of int
+        Linear index or indices into the array.
+
+    order : {'C', 'F'}, optional
+        Indexing order:
+        - 'C' : row-major (C-style)
+        - 'F' : column-major (Fortran-style)
+
+    Returns
+    -------
+    subs : tuple of ndarray or int
+        A tuple of index arrays (or ints for scalar input), one per dimension.
+
 
     Examples
     --------
     >>> shape = (3,3,4)
     >>> a = np.arange(np.prod(shape)).reshape(shape)
     >>> order = 'C'
-    >>> a[1, 2, 3]
-    23
+    >>> np.allclose(a[1, 2, 3], 23)
+    True
     >>> i = sub2index(shape, 1, 2, 3, order=order)
-    >>> a.ravel(order)[i]
-    23
-    >>> index2sub(shape, i, order=order)
-    (1, 2, 3)
+    >>> np.allclose(a.ravel(order)[i], 23)
+    True
+    >>> np.allclose(index2sub(shape, i, order=order), (1, 2, 3))
+    True
 
     See also
     --------
     sub2index
-    '''
+    """
+    
+    shape = tuple(shape)
+
+    if order not in ('C', 'F'):
+        raise ValueError("order must be 'C' or 'F'")
+
     return np.unravel_index(index, shape, order=order)
 
 
-def sub2index(shape, *subscripts, **kwds):
-    '''
-    Returns linear index from multiple subscripts.
+def sub2index(shape, *subscripts, order='C'):
+    """
+    Convert subscripts to linear indices.
 
     Parameters
     ----------
-    shape : array-like
-        shape of array
-    *subscripts :
-        subscripts into array
-    order : {'C','F'}, optional
-        The order of the linear index.
-        'C' means C (row-major) order.
-        'F' means Fortran (column-major) order.
-        By default, 'C' order is used.
+    shape : tuple of ints
+        Shape of the array.
 
-    This function is used to determine the equivalent single index
-    corresponding to a given set of subscript values into an array.
+    *subscripts : int or array_like
+        Subscripts for each dimension. The number of subscripts must match
+        the number of dimensions in `shape`. Subscripts are broadcast together.
+
+    order : {'C', 'F'}, optional
+        Indexing order:
+        - 'C' : row-major (default)
+        - 'F' : column-major
+
+    Returns
+    -------
+    index : ndarray or int
+        Linear index or indices corresponding to the given subscripts.
+
 
     Examples
     --------
-    >>> shape = (3,3,4)
+    >>> shape = (3, 3, 4)
     >>> a = np.arange(np.prod(shape)).reshape(shape)
     >>> order = 'C'
     >>> i = sub2index(shape, 1, 2, 3, order=order)
-    >>> a[1, 2, 3]
-    23
-    >>> a.ravel(order)[i]
-    23
-    >>> index2sub(shape, i, order=order)
-    (1, 2, 3)
+    >>> np.allclose(a[1, 2, 3], 23)
+    True
+    >>> np.allclose(a.ravel(order)[i], 23)
+    True
+    >>> np.allclose(index2sub(shape, i, order=order), (1, 2, 3))
+    True
 
     See also
     --------
     index2sub
-    '''
-    return np.ravel_multi_index(subscripts, shape, **kwds)
+    """
+    
+    shape = tuple(shape)
+
+    if len(subscripts) != len(shape):
+        raise ValueError("Number of subscripts must match number of dimensions")
+
+    if order not in ('C', 'F'):
+        raise ValueError("order must be 'C' or 'F'")
+
+    return np.ravel_multi_index(subscripts, shape, order=order)
 
 
-def is_numlike(obj):
-    """return true if *obj* looks like a number
+def is_numlike(x):
+    """
+    Return True if *x* behaves like a numeric scalar.
+
+    The function considers an object "numlike" if it is:
+    - a Python or NumPy scalar number (int, float, complex), or
+    - a NumPy ndarray of size 1 with a numeric dtype.
+
+    Parameters
+    ----------
+    x : any
+        Object to test.
+
+    Returns
+    -------
+    bool
+        True if `x` represents a numeric scalar value or a single-element
+        numeric array, otherwise False.
 
     Examples
     --------
     >>> is_numlike(1)
     True
+    >>> is_numlike(1j)
+    True
+    >>> is_numlike(1.5)
+    True
+    >>> is_numlike(np.float64(1))
+    True
+
+    >>> is_numlike(np.array(1))
+    True
+    >>> is_numlike(np.array([1]))
+    True
+
+    >>> is_numlike(np.array([1, 2]))
+    False
+    >>> is_numlike(np.array('1'))
+    False
     >>> is_numlike('1')
     False
     >>> is_numlike([1])
     False
+
+    Notes
+    -----
+    - NumPy arrays are only considered numlike if they contain exactly one
+      element and have a numeric dtype.
+    - Multi-element arrays and non-numeric types are not considered numlike.
     """
-    try:
-        obj + 1
-    except TypeError:
-        return False
-    return True
+    # Case 1: Python / NumPy scalar
+    if isinstance(x, numbers.Number):
+        return True
+
+    # Case 2: NumPy array
+    if isinstance(x, np.ndarray):
+        return x.size == 1 and np.issubdtype(x.dtype, np.number)
+
+    return False
 
 
 class JITImport(object):
@@ -702,98 +1058,13 @@ class JITImport(object):
             raise exc
 
 
-class DotDict(dict):
-
-    ''' Implement dot access to dict values
-
-      Examples
-      --------
-       >>> d = DotDict(test1=1,test2=3)
-       >>> d.test1
-       1
-    '''
-    __getattr__ = dict.__getitem__
-
-
-class Bunch(object):
-
-    ''' Implement keyword argument initialization of class
-
-    Examples
-    --------
-    >>> d = Bunch(test1=1,test2=3)
-    >>> (d.test1, d.test2)
-    (1, 3)
-    >>> sorted(d.keys()) ==  ['test1', 'test2']
-    True
-    >>> d.update(test1=5)
-    >>> (d.test1, d.test2)
-    (5, 3)
-    '''
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-    def keys(self):
-        return list(self.__dict__)
-
-    def update(self, ** kwargs):
-        self.__dict__.update(kwargs)
-
-
 def printf(format_, *args):  # @ReservedAssignment
     sys.stdout.write(format_ % args)
 
 
-def sub_dict_select(somedict, somekeys):
-    '''
-    Extracting a Subset from Dictionary
-
-    Examples
-    --------
-    # Update options dict from keyword arguments if
-    # the keyword exists in options
-    >>> opt = dict(arg1=2, arg2=3)
-    >>> kwds = dict(arg2=100,arg3=1000)
-    >>> sub_dict = sub_dict_select(kwds, opt)
-    >>> opt.update(sub_dict)
-    >>> opt == {'arg1': 2, 'arg2': 100}
-    True
-
-    See also
-    --------
-    dict_intersection
-    '''
-    # slower: validKeys = set(somedict).intersection(somekeys)
-    return type(somedict)((k, somedict[k]) for k in somekeys if k in somedict)
-
-
-def parse_kwargs(options, **kwargs):
-    '''
-    Update options dict from keyword arguments if the keyword exists in options
-
-    Examples
-    --------
-    >>> opt = dict(arg1=2, arg2=3)
-    >>> opt = parse_kwargs(opt,arg2=100)
-    >>> opt == {'arg1': 2, 'arg2': 100}
-    True
-    >>> opt2 = dict(arg2=101)
-    >>> opt = parse_kwargs(opt,**opt2)
-
-    See also sub_dict_select
-    '''
-
-    newopts = sub_dict_select(kwargs, options)
-    if len(newopts) > 0:
-        options.update(newopts)
-    return options
-
-
 def moving_average(x, L, axis=0):
     """
-    Return moving average from data using a window of size 2*L+1.
-    If 2*L+1 > len(x) then the mean is returned
+    Returns moving average from data using a window of size 2*L+1.
 
     Parameters
     ----------
@@ -849,31 +1120,152 @@ def moving_average(x, L, axis=0):
     --------
     Reconstruct
     """
-    _assert(0 < L, 'L must be positive')
-    _assert(L == np.round(L), 'L must be an integer')
+    #return _moving_fun(np.mean, x, L, axis)  # alternative is slower and more memory consuming
+    
+    x = np.asarray(x)
+    L = int(L)
 
-    x1 = np.atleast_1d(x)
-    axes = np.arange(x.ndim)
+    if L <= 0:
+        raise ValueError("L must be positive")
 
-    axes[0] = axis
-    axes[axis] = 0
+    axis = np.lib.array_utils.normalize_axis_index(axis, x.ndim)
 
-    x1 = np.transpose(x1, axes)
-    y = np.empty_like(x1)
+    # Move axis to front
+    x = np.swapaxes(x, axis, 0)
 
-    n = x1.shape[0]
-    if n < 2 * L + 1:  # only able to remove the mean
-        y[:] = x1.mean(axis=0)
-        return np.transpose(y, axes)
+    n = x.shape[0]
+    window = 2 * L + 1
 
-    mn = x1[0:2 * L + 1].mean(axis=0)
+    y = np.empty(x.shape, dtype=np.result_type(x.dtype, np.float64))
+
+    if n <= window:
+        y[:] = x.mean(axis=0)
+        return np.swapaxes(y, 0, axis)
+
+    mn = x[0:window].mean(axis=0)
+
+    # First L+1 values correspond to initial window
     y[0:L + 1] = mn
 
     ix = np.r_[L + 1:(n - L)]
-    y[ix] = ((x1[ix + L] - x1[ix - L]) / (2 * L)).cumsum(axis=0) + mn
-    y[n - L::] = y[n - L - 1]
 
-    return np.transpose(y, axes)
+    y[ix] = ((x[ix + L] - x[ix - L - 1]) / window).cumsum(axis=0) + mn
+
+    # Right edge
+    y[n - L:] = y[n - L - 1]
+
+    return np.swapaxes(y, 0, axis)
+
+    
+def _moving_fun(fun, x, L, axis):
+    """Core implementation for moving window functions."""
+    
+    x1 = np.asarray(x)
+    L = int(L)
+
+    if L <= 0:
+        raise ValueError("L must be positive")
+    
+    axis = np.lib.array_utils.normalize_axis_index(axis, x.ndim)
+
+    # Move target axis to front
+    x1 = np.swapaxes(x1, axis, 0)
+
+    n = x1.shape[0]
+    y = np.empty_like(x1, dtype=np.result_type(x1.dtype, np.float64))
+
+    if n <= 2 * L + 1:
+        y[:] = fun(x1, axis=0)
+        return np.swapaxes(y, 0, axis)
+
+    rolling = sliding_window_view(x1, 2 * L + 1, axis=0)
+
+    # Reduce over last axis
+    result = fun(rolling, axis=-1)
+
+    y[L:n - L, ...] = result
+
+    # Edge fill
+    y[:L, ...] = y[L, ...]
+    y[n - L:, ...] = y[n - L - 1, ...]
+
+    return np.swapaxes(y, 0, axis)
+
+
+def moving_max(x, L, axis=0):
+    """
+    Returns the moving maximum from data using a window of size 2*L+1
+    
+    Parameters
+    ----------
+    x : vector or matrix of column vectors
+        of data
+    L : scalar, integer
+        defines the size of the moving average window
+    axis: scalar integer
+        axis along which the moving average is computed. Default axis=0.
+
+    Returns
+    -------
+    y : ndarray
+        moving maximum
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> x1 = np.linspace(1, 5, 5)
+    >>> np.allclose(moving_max(x1, L=1),[3.0, 3.0, 4.0, 5.0, 5.0])
+    True
+    >>> np.allclose(moving_max(x1, L=2), [5.0, 5.0, 5.0, 5.0, 5.0])
+    True
+
+    >>> x2 = np.vstack((x1, x1+5))
+    >>> np.allclose(moving_max(x2, L=1, axis=1),  [[3.0, 3.0, 4.0, 5.0, 5.0], [8.0, 8.0, 9.0, 10.0, 10.0]])
+    True
+    >>> np.allclose(moving_max(x2, L=2, axis=1),  [[5.0, 5.0, 5.0, 5.0, 5.0], [10.0, 10.0, 10.0, 10.0, 10.0]])
+    True
+    
+    """
+    return _moving_fun(np.max, x, L, axis)
+
+
+def moving_median(x, L, axis=0):
+    """
+    Returns the moving mmedia from data using a window of size 2*L+1
+    
+    Parameters
+    ----------
+    x : vector or matrix of column vectors
+        of data
+    L : scalar, integer
+        defines the size of the moving average window
+    axis: scalar integer
+        axis along which the moving average is computed. Default axis=0.
+
+    Returns
+    -------
+    y : ndarray
+        moving meduab
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> x1 = np.linspace(1, 5, 5)
+    >>> np.allclose(moving_median(x1, L=1),[2.0, 2.0, 3.0, 4.0, 4.0])
+    True
+    >>> np.allclose(moving_median(x1, L=2),  [3.0, 3.0, 3.0, 3.0, 3.0])
+    True
+
+    >>> x2 = np.vstack((x1, x1+5))
+    >>> np.allclose(moving_median(x2, L=1, axis=1), [[2.0, 2.0, 3.0, 4.0, 4.0], 
+    ...                                               [7.0, 7.0, 8.0, 9.0, 9.0]])
+    True
+    >>> np.allclose(moving_median(x2, L=2, axis=1),  [[3.0, 3.0, 3.0, 3.0, 3.0], 
+    ...                                               [8.0, 8.0, 8.0, 8.0, 8.0]])
+    True
+    
+    """
+    return _moving_fun(np.median, x, L, axis)
 
 
 def detrendma(x, L, axis=0):
@@ -991,150 +1383,6 @@ def ecross(t, f, ind, v=0):
             (f[ind + 1] - f[ind]))
 
 
-def _findcross(x, method='numba'):
-    '''Return indices to zero up and downcrossings of a vector
-    '''
-    if clib is not None and method == 'clib':
-        ind, m = clib.findcross(x, 0.0)  # pylint: disable=no-member
-        return ind[:int(m)]
-    return _misc_numba.findcross(x)
-
-
-def findcross(x, v=0.0, kind=None, method='clib'):
-    '''
-    Return indices to level v up and/or downcrossings of a vector
-
-    Parameters
-    ----------
-    x : array_like
-        vector with sampled values.
-    v : scalar, real
-        level v.
-    kind : string
-        defines type of wave or crossing returned. Possible options are
-        'dw' : downcrossing wave
-        'uw' : upcrossing wave
-        'cw' : crest wave
-        'tw' : trough wave
-        'd'  : downcrossings only
-        'u'  : upcrossings only
-        None : All crossings will be returned
-
-    Returns
-    -------
-    ind : array-like
-        indices to the crossings in the original sequence x.
-
-    Examples
-    --------
-    >>> import wafo.misc as wm
-    >>> ones = np.ones
-    >>> np.allclose(wm.findcross([0, 1, -1, 1], 0), [0, 1, 2])
-    True
-    >>> v = 0.75
-    >>> t = np.linspace(0,7*np.pi,250)
-    >>> x = np.sin(t)
-    >>> ind = wm.findcross(x, v) # all crossings
-    >>> np.allclose(ind, [  9,  25,  80,  97, 151, 168, 223, 239])
-    True
-
-    >>> ind2 = wm.findcross(x,v,'u')
-    >>> np.allclose(ind2, [  9,  80, 151, 223])
-    True
-    >>> ind3 = wm.findcross(x,v,'d')
-    >>> np.allclose(ind3, [  25,  97, 168, 239])
-    True
-    >>> ind4 = wm.findcross(x,v,'d', method='2')
-    >>> np.allclose(ind4, [  25,  97, 168, 239])
-    True
-
-    >>> from matplotlib import pyplot as plt
-    >>> h0 = plt.plot(t, x, '.', label='data')
-    >>> h1 = plt.plot(t[ind], x[ind], 'r.', label='all crossings')
-    >>> h2 = plt.plot(t, ones(t.shape)*v, label='{} level'.format(v))
-    >>> h3 = plt.plot(t[ind2],x[ind2],'o', label='upcrossings', fillstyle='none')
-    >>> h4 = plt.legend()
-
-    >>> plt.close('all')
-
-    See also
-    --------
-    crossdef
-    wavedef
-    '''
-    xn = np.int8(np.sign(np.atleast_1d(x).ravel() - v))  # @UndefinedVariable
-    ind = _findcross(xn, method)
-    if ind.size == 0:
-        warnings.warn('No level v = %0.5g crossings found in x' % v)
-        return ind
-
-    if kind not in ('du', 'all', None):
-        if kind == 'd':  # downcrossings only
-            t_0 = int(xn[ind[0] + 1] > 0)
-            ind = ind[t_0::2]
-        elif kind == 'u':  # upcrossings  only
-            t_0 = int(xn[ind[0] + 1] < 0)
-            ind = ind[t_0::2]
-        elif kind in ('dw', 'uw', 'tw', 'cw'):
-            # make sure that the first is a level v down-crossing
-            #   if kind=='dw' or kind=='tw'
-            # or that the first is a level v up-crossing
-            #    if kind=='uw' or kind=='cw'
-            first_is_down_crossing = int(xn[ind[0]] > xn[ind[0] + 1])
-            if xor(first_is_down_crossing, kind in ('dw', 'tw')):
-                ind = ind[1::]
-
-            n_c = ind.size  # number of level v crossings
-            # make sure the number of troughs and crests are according to the
-            # wavedef, i.e., make sure length(ind) is odd if dw or uw
-            # and even if tw or cw
-            is_odd = np.mod(n_c, 2)
-            if xor(is_odd, kind in ('dw', 'uw')):
-                ind = ind[:-1]
-        else:
-            raise ValueError('Unknown wave/crossing definition!'
-                             ' ({})'.format(kind))
-    return ind
-
-
-def findextrema(x):
-    '''
-    Return indices to minima and maxima of a vector
-
-    Parameters
-    ----------
-    x : vector with sampled values.
-
-    Returns
-    -------
-    ind : indices to minima and maxima in the original sequence x.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> import wafo.misc as wm
-    >>> t = np.linspace(0,7*np.pi,250)
-    >>> x = np.sin(t)
-    >>> ind = wm.findextrema(x)
-    >>> np.allclose(ind, [18, 53, 89, 125, 160, 196, 231])
-    True
-
-    >>> import matplotlib.pyplot as plt
-    >>> h0 = plt.plot(t, x, '.', label='data')
-    >>> h1 = plt.plot(t[ind], x[ind], 'r.', label='extrema')
-    >>> h2 = plt.legend()
-
-    >>> plt.close('all')
-
-    See also
-    --------
-    findcross
-    crossdef
-    '''
-    dx = np.diff(np.atleast_1d(x).ravel())
-    return findcross(dx, 0.0) + 1
-
-
 def findpeaks(data, n=2, min_h=None, min_p=0.0):
     '''
     Find peaks of vector or matrix possibly rainflow filtered
@@ -1158,6 +1406,7 @@ def findpeaks(data, n=2, min_h=None, min_p=0.0):
 
     Examples
     --------
+
     Find highest 8 peaks that are not
     less that 0.3*"global max" and have
     rainflow amplitude larger than 5.
@@ -1180,223 +1429,65 @@ def findpeaks(data, n=2, min_h=None, min_p=0.0):
     --------
     findtp
     '''
-    data1 = np.atleast_1d(data)
+
+    data1 = np.asarray(data, dtype=np.float64)
     dmax = data1.max()
+
     if min_h is None:
         dmin = data1.min()
         min_h = 0.05 * (dmax - dmin)
+
     ndim = data1.ndim
-    data1 = np.atleast_2d(data1)
-    nrows, mcols = data1.shape
+    data2 = np.atleast_2d(data1)
+    nrows, mcols = data2.shape
 
-    # Finding turningpoints of the spectrum
-    # Returning only those with rainflowcycle heights greater than h_min
-    ind_p = []  # indices to peaks
-    ind = []
-    for iy in range(nrows):  # find all peaks
-        tp = findtp(data1[iy], min_h)
-        if len(tp):
-            ind = tp[1::2]  # extract indices to maxima only
-        else:  # did not find any , try maximum
-            ind = np.atleast_1d(data1[iy].argmax())
+    ind_p = []
 
-        if ndim > 1:
+    for iy in range(nrows):
+
+        i_tp = findtp(data2[iy], min_h)
+
+        if len(i_tp):
+            peaks_row = i_tp[1::2]
+        else:
+            peaks_row = np.array([data2[iy].argmax()], dtype=np.int64)
+
+        if ndim == 1:
+            ind = peaks_row
+        else:
             if iy == 0:
-                ind2 = np.flatnonzero(data1[iy, ind] > data1[iy + 1, ind])
+                mask = data2[iy, peaks_row] > data2[iy + 1, peaks_row]
             elif iy == nrows - 1:
-                ind2 = np.flatnonzero(data1[iy, ind] > data1[iy - 1, ind])
+                mask = data2[iy, peaks_row] > data2[iy - 1, peaks_row]
             else:
-                ind2 = np.flatnonzero((data1[iy, ind] > data1[iy - 1, ind]) &
-                                      (data1[iy, ind] > data1[iy + 1, ind]))
+                mask = ((data2[iy, peaks_row] > data2[iy - 1, peaks_row]) &
+                        (data2[iy, peaks_row] > data2[iy + 1, peaks_row]))
 
-            if len(ind2):
-                ind_p.append((ind[ind2] + iy * mcols))
+            ind_p.append(peaks_row[mask] + iy * mcols)
 
     if ndim > 1:
-        ind = np.hstack(ind_p) if len(ind_p) else []
-    if len(ind) == 0:
-        return []
-
-    peaks = data1.take(ind)
-    ind2 = peaks.argsort()[::-1]
-
-    # keeping only the Np most significant peaks.
-    nmax = min(n, len(ind))
-    ind = ind[ind2[:nmax]]
-    if min_p > 0:
-        # Keeping only peaks larger than min_p percent relative to the maximum
-        # peak
-        ind = ind[(data1.take(ind) > min_p * dmax)]
-
-    return ind
-
-
-def findrfc_astm(tp):
-    """
-    Return rainflow counted cycles
-
-    Nieslony's Matlab implementation of the ASTM standard practice for rainflow
-    counting ported to a Python C module.
-
-    Parameters
-    ----------
-    tp : array-like
-        vector of turningpoints (NB! Only values, not sampled times)
-
-    Returns
-    -------
-    sig_rfc : array-like
-        array of shape (n,3) with:
-        sig_rfc[:,0] Cycles amplitude
-        sig_rfc[:,1] Cycles mean value
-        sig_rfc[:,2] Cycle type, half (=0.5) or full (=1.0)
-    """
-    return _misc_numba.findrfc_astm(tp)
-#     y1 = np.atleast_1d(tp).ravel()
-#     sig_rfc, cnr = clib.findrfc3_astm(y1)
-#     # the sig_rfc was constructed too big in rainflow.rf3, so
-#     # reduce the sig_rfc array as done originally by a matlab mex c function
-#     n = len(sig_rfc)
-#     # sig_rfc = sig_rfc.__getslice__(0, n - cnr[0])
-#     # sig_rfc holds the actual rainflow counted cycles, not the indices
-#     return sig_rfc[:n - cnr[0]]
-
-
-def findrfc(tp, h=0.0, method='clib'):
-    '''
-    Return indices to rainflow cycles of a sequence of TP.
-
-    Parameters
-    -----------
-    tp : array-like
-        vector of turningpoints (NB! Only values, not sampled times)
-    h : real scalar
-        rainflow threshold. If h>0, then all rainflow cycles with height
-        smaller than h are removed.
-    method : string, optional
-        'clib' 'None'
-        Specify 'clib' for calling the c_functions, otherwise fallback to
-        the Python implementation.
-
-    Returns
-    -------
-    ind : ndarray of int
-        indices to the rainflow cycles of the original sequence TP.
-
-    Examples
-    --------
-    >>> import wafo.misc as wm
-    >>> t = np.linspace(0,7*np.pi,250)
-    >>> x = np.sin(t) + 0.1*np.sin(50*t)
-    >>> ind = wm.findextrema(x)
-    >>> ti, tp = t[ind], x[ind]
-
-    >>> ind1 = wm.findrfc(tp, 0.3)
-    >>> np.allclose(ind1, [0, 9, 32, 53, 74, 95,116, 137])
-    True
-    >>> ind2 = wm.findrfc(tp, 0.3, method=0)
-    >>> np.allclose(ind2, [  0,   9,  32,  53,  74,  95, 116, 137, 146])
-    True
-    >>> ind3 = wm.findrfc(tp, 0.3, method=1)
-    >>> np.allclose(ind3, [  0,   9,  32,  53,  74,  95, 116, 137, 146])
-    True
-    >>> ind3 = wm.findrfc(tp, 0.3, method=2)
-    >>> np.allclose(ind3, [  0,   9,  32,  53,  74,  95, 116, 137])
-    True
-
-    >>> import matplotlib.pyplot as plt
-    >>> h0 = plt.plot(t, x,'-', label='data')
-    >>> h1 = plt.plot(ti, tp,'r.', label='turning points')
-    >>> h2 = plt.plot(ti[ind1], tp[ind1], 'ko', label='filtered turning points')
-    >>> h3 = plt.legend()
-
-    >>> plt.close('all')
-
-    See also
-    --------
-    rfcfilter,
-    findtp.
-    '''
-    y = np.atleast_1d(tp).ravel()
-
-    t_start = int(y[0] > y[1])  # first is a max, ignore it
-    y = y[t_start::]
-    n = len(y)
-    nc = n // 2
-
-    if nc < 1:
-        return zeros(0, dtype=int)  # No RFC cycles*/
-
-    if (y[0] > y[1] and y[1] > y[2] or
-            y[0] < y[1] and y[1] < y[2]):
-        warnings.warn('This is not a sequence of turningpoints, exit')
-        return zeros(0, dtype=int)
-
-    if clib is not None and method == 'clib':
-        ind, ix = clib.findrfc(y, h)  # pylint: disable=no-member
-        ix = int(ix)
+        ind = np.hstack(ind_p) if len(ind_p) else np.empty(0, dtype=np.int64)
     else:
-        if isinstance(method, str):
-            method = 2
-        ind = _misc_numba.findrfc(y, h, method)
-        ix = len(ind)
+        ind = np.asarray(ind, dtype=np.int64)
 
-    return np.sort(ind[:ix]) + t_start
+    if ind.size == 0:
+        return ind
 
+    peaks = data2.ravel()[ind]
 
-def rfcfilter(x, h, method=0):
-    """
-    Rainflow filter a signal.
+    # filter first
+    if min_p > 0:
+        keep = peaks > min_p * dmax
+        ind = ind[keep]
+        peaks = peaks[keep]
 
-    Parameters
-    -----------
-    x : vector
-        Signal.   [nx1]
-    h : real, scalar
-        Threshold for rainflow filter.
-    method : scalar, integer
-        0 : removes cycles with range < h. (default)
-        1 : removes cycles with range <= h.
+    # rank after filtering
+    idx = peaks.argsort()[::-1]
+    nmax = min(n, len(ind))
 
-    Returns
-    --------
-    y   = Rainflow filtered signal.
+    return ind[idx[:nmax]]
 
-    Examples:
-    ---------
-    # 1. Filtered signal y is the turning points of x.
-    >>> import wafo.data as data
-    >>> import wafo.misc as wm
-    >>> x = data.sea()
-    >>> y = wm.rfcfilter(x[:,1], h=0, method=1)
-    >>> np.allclose(y[0:5], [-1.2004945 , 0.83950546, -0.09049454, -0.02049454, -0.09049454])
-    True
-    >>> np.allclose(y.shape, (2172,))
-    True
-
-    # 2. This removes all rainflow cycles with range less than 0.5.
-    >>> y1 = wm.rfcfilter(x[:,1], h=0.5)
-    >>> np.allclose(y1.shape, (863,))
-    True
-    >>> np.allclose(y1[0:5], [-1.2004945 , 0.83950546, -0.43049454, 0.34950546, -0.51049454])
-    True
-    >>> ind = wm.findtp(x[:,1], h=0.5)
-    >>> y2 = x[ind,1]
-    >>> np.allclose(y2[0:5], [-1.2004945 ,  0.83950546, -0.43049454,  0.34950546, -0.51049454])
-    True
-    >>> np.allclose(y2[-5::], [ 0.83950546, -0.64049454,  0.65950546, -1.0004945 ,  0.91950546])
-    True
-
-    See also
-    --------
-    findrfc
-    """
-    y = np.atleast_1d(x).ravel()
-    ix = _misc_numba.findrfc(y, h, method)
-    return y[ix]
-
-
-def findtp(x, h=0.0, kind=None, method='clib'):
+def findtp(x, h=0.0, kind=None,  mode='inclusive'):
     '''
     Return indices to turning points (tp) of data, optionally rainflow filtered.
 
@@ -1417,10 +1508,10 @@ def findtp(x, h=0.0, kind=None, method='clib'):
         will be returned, otherwise only the rainflow filtered
         min and max, which define a wave according to the
         wave definition, will be returned.
-    method : string, optional
-        'clib' 'None'
-        Specify 'clib' for calling the c_functions, otherwise fallback to
-        the Python implementation.
+    mode : {'inclusive', 'strict'}
+        Threshold rule:
+        - 'inclusive' : keep cycles with range >= h
+        - 'strict'    : keep cycles with range > h
 
     Returns
     -------
@@ -1486,7 +1577,7 @@ def findtp(x, h=0.0, kind=None, method='clib'):
             ind = np.r_[ind, n - 1]
 
     if h > 0.0:
-        ind1 = findrfc(x[ind], h, method)
+        ind1 = findrfc(x[ind], h, mode=mode, assume_tp=True)
         ind = ind[ind1]
 
     if kind in ('mw', 'Mw'):
@@ -1737,6 +1828,7 @@ def findoutliers(x, zcrit=0.0, dcrit=None, ddcrit=None, verbose=False):
                      _find_consecutive_equal_values(dxn, zcrit)))
 
     indg = ones(xn.size, dtype=bool)
+
     if ind.size > 1:
         ind = np.unique(ind)
         indg[ind] = 0
@@ -1785,12 +1877,13 @@ def common_shape(*args, ** kwds):
     broadcast, broadcast_arrays
 
     """
+
     shape = kwds.get('shape')
     x0 = 1 if shape is None else np.ones(shape)
     return tuple(np.broadcast(x0, *args).shape)
 
 
-def argsreduce(condition, * args):
+def argsreduce(condition, *args):
     """ Return the elements of each input array that satisfy some condition.
 
     Parameters
@@ -1829,8 +1922,25 @@ def argsreduce(condition, * args):
     --------
     numpy.extract
     """
+
+s    condition = np.asarray(condition, dtype=bool)
+    condition, *arrays = np.broadcast_arrays(condition, *args)
+
+    return tuple(arr[condition] for arr in arrays)
+
+
+    # Ensure boolean condition
+    condition = np.asarray(condition, dtype=bool)
+
+    # Broadcast condition and all args to common shape
+    condition, *arrays = np.broadcast_arrays(condition, *args)
+
+    # Extract values
+    return tuple(np.extract(condition, arr) for arr in arrays)
+
+
     newargs = np.atleast_1d(*args)
-    if not isinstance(newargs, list):
+    if not isinstance(newargs, tuple):
         newargs = [newargs, ]
     expand_arr = (condition == condition)
     return [np.extract(condition, arr1 * expand_arr) for arr1 in newargs]
@@ -1838,7 +1948,7 @@ def argsreduce(condition, * args):
 
 def stirlerr(n):
     '''
-    Return error of Stirling approximation,
+    Returns error of Stirling approximation,
         i.e., log(n!) - log( sqrt(2*pi*n)*(n/exp(1))**n )
 
     Examples
@@ -2174,10 +2284,10 @@ def nextpow2(x):
     Examples
     --------
     >>> import wafo.misc as wm
-    >>> wm.nextpow2(10)
-    4
-    >>> wm.nextpow2(np.arange(5))
-    3
+    >>> np.allclose(wm.nextpow2(10), 4)
+    True
+    >>> np.allclose(wm.nextpow2(np.arange(5)), 3)
+    True
     '''
     t = np.isscalar(x) or len(x)
     if t > 1:
@@ -2593,6 +2703,7 @@ def tranproc(x, f, x0, *xi):
     xo, fo = trangood(xo, fo, min_x=min(x0), max_x=max(x0), max_n=nmax)
 
     n = f.shape[0]
+
     xu = (n - 1) * (x0 - xo[0]) / (xo[-1] - xo[0])
 
     fi = np.asarray(np.floor(xu), dtype=int)
@@ -2609,6 +2720,7 @@ def tranproc(x, f, x0, *xi):
     if num_derivatives > 0:
         y = [y0]
         fxder = _diff(xo, fo, x0, num_derivatives)
+
         # Calculate the transforms of the derivatives of X.
         dfuns = [_der_1, _der_2, _der_3, _der_4]
         for dfun in dfuns[:num_derivatives]:
@@ -2787,49 +2899,43 @@ def plot_histgrm(data, bins=None, range=None,  # @ReservedAssignment
 
 
 def num2pistr(x, n=3, numerator_max=10, denominator_max=10):
-    '''
-    Convert a scalar to a text string in fractions of pi
-        if the numerator is less than 10 and not equal 0
-               and if the denominator is less than 10.
-
-    Parameters
-    ----------
-    x   = a scalar
-    n   = maximum digits of precision. (default 3)
-
-    Returns
-    -------
-    xtxt = a text string in fractions of pi
+    r'''
+    Convert a scalar to a text string in fractions of pi.
 
     Examples
     --------
-    >>> import wafo.misc as wm
-    >>> wm.num2pistr(np.pi*3/4)=='3\\pi/4'
+    >>> import utilities.numpy_utils as wm
+    >>> wm.num2pistr(np.pi*3/4)==r'3\pi/4'
     True
-    >>> wm.num2pistr(-np.pi/4)=='-\\pi/4'
+    >>> wm.num2pistr(-np.pi/4)==r'-\pi/4'
     True
-    >>> wm.num2pistr(-np.pi)=='-\\pi'
+    >>> wm.num2pistr(-np.pi)==r'-\pi'
     True
     >>> wm.num2pistr(-1/4)=='-0.25'
     True
     '''
+    
     def _denominator_text(den):
-        return '' if np.abs(den) == 1 else '/%d' % den
+        return '' if abs(den) == 1 else f'/{den}'
 
     def _numerator_text(num):
-        if np.abs(num) == 1:
+        if abs(num) == 1:
             return '-' if num == -1 else ''
-        return '{:d}'.format(num)
-    frac = fractions.Fraction.from_float(x / pi).limit_denominator(int(1e+13))
+        return f'{num:d}'
+
+    frac = fractions.Fraction(x / pi).limit_denominator()
     num, den = frac.numerator, frac.denominator
-    if (den < denominator_max) and (num < numerator_max) and (num != 0):
-        return r'{0:s}\pi{1:s}'.format(_numerator_text(num),
-                                       _denominator_text(den))
-    fmt = '{:0.' + '{:d}'.format(n) + 'g}'
-    return fmt.format(x)
+
+    if (abs(den) <= denominator_max and 
+        abs(num) <= numerator_max and 
+        num != 0):
+        return rf'{_numerator_text(num)}\pi{_denominator_text(den)}'
+
+    return f'{x:.{n}g}'
 
 
-def fourier(data, t=None, period=None, m=None, method='trapz'):
+
+def fourier(data, t=None, period=None, m=None, method='trapezoid'):
     '''
     Returns Fourier coefficients.
 
@@ -2844,7 +2950,7 @@ def fourier(data, t=None, period=None, m=None, method='trapz'):
     m : scalar integer
         defines number of harmonics desired (default m = n)
     method : string
-        integration method used
+        integration method used ("trapezoid" or "simpson")
 
     Returns
     -------
@@ -2890,7 +2996,7 @@ def fourier(data, t=None, period=None, m=None, method='trapz'):
     n = len(t) if n is None else n
     m = n if m is None else m
     period = t[-1] - t[0] if period is None else period
-    intfun = trapz if method.startswith('trapz') else simps
+    intfun = trapezoid if method.startswith('trap') else simpson
 
     # Define the vectors for computing the Fourier coefficients
     t.shape = (1, -1)
