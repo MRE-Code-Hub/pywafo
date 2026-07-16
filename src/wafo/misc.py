@@ -1,16 +1,13 @@
-'''
+"""
 Misc
-'''
-
-
+"""
 import fractions
 import numbers
 import sys
 import warnings
 from time import strftime, gmtime
 import numpy as np
-from numpy import (sqrt, arctan2, sin, cos, exp, log, log1p,
-                   inf, pi, zeros, ones, meshgrid, ndarray)
+from numpy import meshgrid
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.special import gammaln, betaln  # pylint: disable=no-name-in-module
 from scipy.integrate import trapezoid, simpson
@@ -19,7 +16,6 @@ from scipy.integrate import trapezoid, simpson
 from wafo.plotbackend import plotbackend as plt
 from wafo._misc_numba import findrfc, findcross, findexrema
 from wafo._nieslony_numba import findrfc_astm
-
 
 FLOATINFO = np.finfo(float)
 _tiny_name = 'tiny' if np.__version__ < '1.22' else 'smallest_normal'
@@ -44,40 +40,65 @@ __all__ = ['now', 'spaceline', 'narg_smallest', 'args_flat', 'is_numlike',
 
 
 def to_scalar(x):
-    """Convert 1 element numpy arrays to scalar
-    
-    Notes
-    -----
-    Raises error for multiellement arrays
+    """
+    Convert a NumPy array containing a single element to a Python scalar.
+
+    Parameters
+    ----------
+    x : object
+        Input value.
+
+    Returns
+    -------
+    object
+        Scalar value if x is a one-element NumPy array, otherwise x.
+
+    Raises
+    ------
+    ValueError
+        If x is a NumPy array containing more than one element.
 
     Examples
     --------
+    >>> to_scalar(np.array(0))
+    0
     >>> to_scalar(np.array([1]))
     1
     >>> to_scalar(np.array([[2]]))
     2
     """
-    if type(x) is ndarray:
+    if isinstance(x, np.ndarray):
         if x.size == 1:
-            return x.ravel().item()
+            return x.item()
         raise ValueError(f"Expected array with 1 element, got {x.size}")
     return x
 
 
 def around(val, decimals=0):
-    """Evenly round to the given number of decimals
+    """
+    Round values to the specified number of decimal places.
 
     Parameters
     ----------
-    val: real scalar or array-like
+    val : scalar or array_like
+        Value or values to round.
+    decimals : int, optional
+        Number of decimal places to round to (default: 0).  If
+        decimals is negative, it specifies the number of positions to
+        the left of the decimal point.
 
     Returns
     -------
-    rval: real scalar or list of real scalars
+    rval : int, float, list, or nested list
+        Rounded values converted to native Python types. 
+        Finite values are returned as integers when decimals == 0. 
+        Non-finite values (e.g. inf and nan) are preserved.
+        For decimals != 0, floating-point values are returned.
 
     Notes
-    -----
-    This function is useful if you want rvals to have exactly n decimals.
+    -----        
+    Unlike numpy.around, this function returns Python scalars or lists
+    rather than NumPy arrays.
 
     Examples
     --------
@@ -85,6 +106,8 @@ def around(val, decimals=0):
     1
     >>> around(1.23456789, decimals=2)
     1.23
+    >>> around([1.23456789], decimals=2)
+    [1.23]
     >>> around(1.23456789, decimals=3)
     1.235
     >>> around(1.23456789, decimals=4)
@@ -102,15 +125,37 @@ def around(val, decimals=0):
     >>> around([1.23456789, 2.23456789], decimals=5)
     [1.23457, 2.23457]
 
+    >>> around(np.inf)
+    inf
+    >>> around(np.nan)
+    nan
+    >>> around([1.23456789, np.inf, np.nan])
+    [1, inf, nan]
+    
+    >>> around([[1.2, np.inf], [np.nan, 4.8]])
+    [[1, inf], [nan, 5]]
+
     """
+
+    rval = np.around(val, decimals)
+
     if decimals == 0:
-        if np.ndim(val) == 0:
-            return int(np.around(val))
-        return list(int(np.around(v)) for v in val)
-    scale = 10**decimals
-    if np.ndim(val) == 0:
-        return int(np.around(val * scale)) / scale
-    return list(int(np.around(v * scale)) / scale for v in val)
+        if rval.ndim == 0:
+            return int(rval) if np.isfinite(rval) else float(rval)
+        
+        if np.all(np.isfinite(rval)):
+            return rval.astype(int).tolist()
+
+        obj = rval.astype(object)
+        mask = np.isfinite(rval)
+        obj[mask] = obj[mask].astype(int)
+
+        return obj.tolist()
+    
+    if rval.ndim == 0:
+        return rval.item()
+    
+    return rval.tolist()
 
 
 def xor(a, b):
@@ -119,17 +164,22 @@ def xor(a, b):
 
 
 def lfind(haystack, needle, maxiter=None):
-    """Return indices to the maxiter first needles in the haystack as an iterable generator.
+    """Yield indices of matching elements in haystack.
 
     Parameters
     ----------
-    haystack: list or tuple of items
-    needle: item to find
-    maxiter: scalar integer maximum number of occurences
-
-    Returns
-    -------
-    indices_gen: generator object
+    haystack : sequence
+        Object supporting  ``haystack.index(value, start)``.
+    needle : object
+        Value to search for.
+    maxiter : int, optional
+        Maximum number of occurrences to return.
+        If None, all occurrences are returned.
+   
+    Yields
+    ------
+    int
+        Index of each matching element.
 
     Examples
     --------
@@ -141,21 +191,37 @@ def lfind(haystack, needle, maxiter=None):
     >>> [i for i in lfind(haystack, 0, 2)]
     []
     """
-    maxiter = inf if maxiter is None else maxiter
+
+    if maxiter is not None and maxiter < 0:
+        raise ValueError("maxiter must be non-negative")
+
+    maxiter = np.inf if maxiter is None else maxiter
     ix = -1
-    i = 0
-    while i < maxiter:
-        i += 1
+    count = 0
+    while count < maxiter:
         try:
             ix = haystack.index(needle, ix + 1)
             yield ix
-        except (ValueError, KeyError):
+            count += 1
+        except ValueError:
             break
 
 
 def check_random_state(seed):
-    """Turn seed into a np.random.RandomState instance
+    """Convert a seed into a NumPy RandomState instance.
+        
+    Parameters
+    ----------
+    seed : None, int, numpy.random.RandomState, or numpy.random
+        Seed used to initialize the random number generator.
 
+    Returns
+    -------
+    rs : numpy.random.RandomState
+        Random number generator corresponding to `seed`.
+
+    Notes
+    -----
     If seed is None (or np.random), return the RandomState singleton used
     by np.random.
     If seed is an int, return a new RandomState instance seeded with seed.
@@ -168,7 +234,11 @@ def check_random_state(seed):
     >>> rs1 = check_random_state(seed=1)
     >>> rs2 = check_random_state(seed=np.random.RandomState(1))
 
-    check_random_state(seed=2.5)
+    >>> check_random_state(seed=2.5)
+    Traceback (most recent call last):
+    ...
+    ValueError: 2.5 cannot be used to seed a numpy.random.RandomState instance
+
     """
     if seed is None or seed is np.random:
         return np.random.mtrand._rand  # pylint: disable=protected-access
@@ -176,8 +246,10 @@ def check_random_state(seed):
         return np.random.RandomState(seed)
     if isinstance(seed, np.random.RandomState):
         return seed
-    msg = '{} cannot be used to seed a numpy.random.RandomState instance'
-    raise ValueError(msg.format(seed))
+
+    raise ValueError(
+        f"{seed!r} cannot be used to seed a numpy.random.RandomState instance"
+    )
 
 
 def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
@@ -208,9 +280,10 @@ def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
         If an element is not callable, it is treated as a constant and assigned
         directly to the output where the condition is True.
     xi : tuple of array_like, optional
-        Input arrays passed to the functions in `funclist`, i.e., (x0, x1,...., xn).
-        These arrays must be broadcastable to a common shape. If `xi` is a single array, it may
-        be passed directly (it will be converted to a tuple internally).
+        Input arrays passed to the functions in `funclist`,
+        i.e., ``(x0, x1, ..., xn)``.
+        These arrays must be broadcastable to a common shape. If `xi` is a single 
+        array, it may be passed directly (it will be converted to a tuple internally).
 
         If `xi` is None, functions should not expect array inputs.
 
@@ -225,31 +298,38 @@ def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
     Returns
     -------
     out : ndarray
-        An array with the same shape as the broadcasted inputs. Each element
-        is computed according to the first condition that evaluates to True.
-        Elements not covered by any condition are set to `fillvalue`.
+        An array with the common broadcast shape of the conditions
+        and input arrays. Each element is computed according to the
+        last condition that evaluates to True.        
+        Elements not covered by any condition are set to `fillvalue`,
+        unless an "otherwise" function is supplied.
+
 
     See Also
     --------
-    lazyselect, lazywhere,
+    lazyselect, lazywhere
 
     Notes
     -----
+    - The output dtype is inferred from `fillvalue` and the input arrays.
+    - If multiple conditions are True for the same element, the value from
+      the last matching condition is used.
     - Only the necessary elements of `xi` are passed to each function,
       improving efficiency.
+    - Functions in `funclist` should return values safely castable to the
+      inferred output dtype.
     - Functions in `funclist` must return values compatible with the number
       of True elements in their corresponding condition.
     - This function is similar to `numpy.piecewise` but evaluates functions
-      only on selected elements (lazy evaluation).
-
+      only on elements where their condition is True.
 
     The result is::
 
           |--
-          |funclist[0](x0[condlist[0]], x1[condlist[0]],..., xn[condlist[0]])
-    out = |funclist[1](x0[condlist[1]], x1[condlist[1]],..., xn[condlist[1]])
+          |funclist[0](x0[condlist[0]], x1[condlist[0]], ..., xn[condlist[0]])
+    out = |funclist[1](x0[condlist[1]], x1[condlist[1]], ..., xn[condlist[1]])
           |...
-          |funclist[n2](x0[condlist[n2]], x1[condlist[n2]],..,xn[condlist[n2]])
+          |funclist[n2](x0[condlist[n2]], x1[condlist[n2]], ..., xn[condlist[n2]])
           |--
 
     Examples
@@ -261,15 +341,15 @@ def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
     ...    [-1, -1, -1,  1,  1,  1])
     True
 
-    Define the absolute value, which is ``-x`` for ``x <0`` and ``x`` for
-    ``x >= 0``.
+    Define the absolute value, which is ``-x`` for ``x < 0`` and ``x`` 
+    for ``x >= 0``.
 
     >>> np.allclose(piecewise([x < 0, x >= 0], [lambda x: -x, lambda x: x], xi=(x,)),
     ...             [ 2.5,  1.5,  0.5,  0.5,  1.5,  2.5])
     True
 
-    Define the absolute value, which is ``-x*y`` for ``x*y <0`` and ``x*y`` for
-    ``x*y >= 0``
+    Define the absolute value, which is ``-x*y`` for ``x*y < 0`` and ``x*y``
+    for ``x*y >= 0``.
     >>> X, Y = np.meshgrid(x, x)
     >>> np.allclose(piecewise([X * Y < 0, ], [lambda x, y: -x * y,
     ...                                       lambda x, y: x * y], xi=(X, Y)),
@@ -286,20 +366,23 @@ def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
     True
     """
     
-    def otherwise_condition(condlist):
+    def _otherwise_condition(condlist):
         return ~np.logical_or.reduce(condlist, axis=0)
+
+    if not condlist:
+        raise ValueError("condlist must not be empty")
 
     # Validate lengths
     num_cond, num_fun = len(condlist), len(funclist)
-    if num_cond not in (num_fun, num_fun - 1):
+    if num_fun not in (num_cond, num_cond + 1):
         raise ValueError("function list and condition list must match")
 
     # Broadcast conditions
     condlist = list(np.broadcast_arrays(*condlist))
 
     # Add default condition if needed
-    if len(condlist) == len(funclist) - 1:
-        condlist.append(otherwise_condition(condlist))
+    if num_fun == num_cond + 1:
+        condlist.append(_otherwise_condition(condlist))
 
     # Prepare inputs
     if xi is None:
@@ -310,13 +393,17 @@ def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
         if not isinstance(xi, tuple):
             xi = (xi,)
         arrays = np.broadcast_arrays(*xi)
-        shape = arrays[0].shape
         dtype = np.result_type(*arrays, fillvalue)
+
+        # All conditions already share condlist[0].shape and all
+        # inputs share arrays[0].shape.
+        shape = np.broadcast_shapes(condlist[0].shape, arrays[0].shape)
+        arrays = [np.broadcast_to(arr, shape) for arr in arrays]
+        condlist = [np.broadcast_to(con, shape) for con in condlist]
 
     out = np.full(shape, fillvalue, dtype)
 
     for cond, func in zip(condlist, funclist):
-
         if not cond.any():
             continue
 
@@ -325,6 +412,7 @@ def piecewise(condlist, funclist, xi=None, fillvalue=0.0, args=(), **kw):
             np.place(out, cond, func(*vals, **kw))
         else:
             np.putmask(out, cond, func)
+
     return out
 
 
@@ -347,26 +435,37 @@ def lazywhere(condition, arrays, f, fillvalue=None, f2=None):
         as positional arguments and return values compatible with the mask.
 
     fillvalue : scalar, optional
-        Value used where `condition` is False. If not provided, `f2` must be given.
+        Value used where `condition` is False. 
+        If not provided, `f2` must be given.
 
     f2 : callable, optional
         Function applied where `condition` is False.
+        Must be provided if `fillvalue` is None.
 
     Returns
     -------
     out : ndarray
-        Result array with the same shape as the broadcasted inputs.
+        Result array with the common broadcast shape of `condition`
+        and the input arrays.
 
     Notes
     -----
-    Equivalent to:
+    - Functions are evaluated only on the elements selected by their mask.
+    - Functions must return values whose shape is compatible with the 
+      number of true/false elements in `condition`.
+    - The output dtype is inferred from `fillvalue` and/or the input arrays.
+    - Functions should return values safely castable to the inferred
+      output dtype.
+
+    Equivalent in result to::
+
         np.where(condition, f(*arrays), fillvalue)
-    or:
+
+    or::
+
         np.where(condition, f(*arrays), f2(*arrays))
 
-    but evaluates `f` and `f2` only where needed.  The functions must 
-    return values compatible with the number of True/False
-    elements in `condition`.
+    but evaluates `f` and `f2` only on the elements where they are needed.
 
     Examples
     --------
@@ -381,9 +480,14 @@ def lazywhere(condition, arrays, f, fillvalue=None, f2=None):
     >>> np.allclose(lazywhere(a > 2, (a, b), f, f2=f2), [  25.,  144.,   21.,   32.])
     True
 
+    >>> cond = np.array([[True], [False]])
+    >>> x = np.array([[1, 2]])
+    >>> np.allclose(lazywhere(cond, (x,), lambda x: x, fillvalue=0),
+    ...             [[1, 2],
+    ...              [0, 0]])
+    True
     """
-    
-    
+
     if len(arrays) == 0:
         raise ValueError("arrays must contain at least one array")
 
@@ -394,9 +498,14 @@ def lazywhere(condition, arrays, f, fillvalue=None, f2=None):
 
     arrays = np.broadcast_arrays(*arrays)
     condition = np.asarray(condition, dtype=bool)
-    condition = np.broadcast_to(condition, arrays[0].shape)
 
-    shape = arrays[0].shape
+    shape = np.broadcast_shapes(
+        condition.shape,
+        arrays[0].shape,
+    )
+
+    condition = np.broadcast_to(condition, shape)
+    arrays = tuple(np.broadcast_to(arr, shape) for arr in arrays)
 
     # dtype determination
     if f2 is None:
@@ -431,8 +540,9 @@ def lazyselect(condlist, funclist, arrays, default=0):
         override earlier ones if multiple are True.
 
     funclist : sequence of callables
-        Functions corresponding to each condition. Each must accept
-        `arrays` as arguments and return values compatible with the mask.
+        Functions corresponding to each condition. Each must accept the
+        elements of `arrays` as positional arguments and return values
+        compatible with the number of True elements in its condition.
 
     arrays : tuple of array_like
         Input arrays, broadcastable to a common shape.
@@ -443,35 +553,41 @@ def lazyselect(condlist, funclist, arrays, default=0):
     Returns
     -------
     out : ndarray
-        Output array with the same shape as broadcasted inputs.
+        Output array with the common broadcast shape of the
+        conditions and input arrays.
 
     Notes
     -----
     - Functions are evaluated only on the subset of elements where their
       condition is True (lazy evaluation).
     - If multiple conditions are True, the last one takes precedence.
+    - The output dtype is inferred from `default` and the input arrays.
+    - Functions should return values safely castable to the inferred output dtype.
+    - Functions must return values compatible with the number of True
+      elements in their corresponding condition.
+    
+    Conceptually equivalent to evaluating::
+
+        choicelist = [fun(*arrays) for fun in funclist]
+
+    and selecting elements from the resulting arrays according to
+    `condlist`, except that functions are evaluated only where their
+    conditions are True.
+
+    All input arrays must be broadcastable to a common shape.
+
+    All functions in `funclist` must accept arguments in the order
+    given in `arrays`.
 
 
-    See also
+    See Also
     --------
     lazywhere, piecewise
-
-    Notes
-    -----
-    Lazily evaluates the choicelist = [fun(*arrays) for fun in funclist],
-    depending on conditions and returns an array drawn from elements in choicelist,
-
-    Notice it assumes that all `arrays` are of the same shape, or can be
-    broadcasted together.
-
-    All functions in `funclist` must accept array arguments in the order
-    given in `arrays` and must return an array of the same shape as broadcasted
-    `arrays`.
 
     Examples
     --------
     >>> x = np.arange(6)
-    >>> np.allclose(np.select([x <3, x > 3], [x**2, x**3], default=0),
+    >>> np.allclose(np.select([x < 3, x > 3], [x**2, x**3], default=0),
     ...             [  0,   1,   4,   0,  64, 125])
     True
     >>> np.allclose(lazyselect([x < 3, x > 3], [lambda x: x**2, lambda x: x**3], (x,)),
@@ -498,12 +614,18 @@ def lazyselect(condlist, funclist, arrays, default=0):
     arrays = np.broadcast_arrays(*arrays)
 
     # Normalize and broadcast conditions
-    condlist = [np.asarray(cond, dtype=bool) for cond in condlist]
-    condlist = [np.broadcast_to(cond, arrays[0].shape) for cond in condlist]
+    condlist = np.broadcast_arrays(*[np.asarray(cond, dtype=bool) for cond in condlist])
+    shape = np.broadcast_shapes(
+        condlist[0].shape,
+        arrays[0].shape,
+    )
+
+    arrays = tuple(np.broadcast_to(arr, shape) for arr in arrays)
+    condlist = [np.broadcast_to(cond, shape) for cond in condlist]
 
     # Output dtype
     dtype = np.result_type(*arrays, default)
-    out = np.full(arrays[0].shape, default, dtype=dtype)
+    out = np.full(shape, default, dtype=dtype)
 
     # Apply functions
     for cond, func in zip(condlist, funclist):
@@ -567,9 +689,9 @@ def rotation_matrix(heading, pitch, roll):
     # Convert to radians
     rheading, rpitch, rroll = np.deg2rad([heading, pitch, roll])    
     # Trig values
-    cH, sH = cos(rheading), sin(rheading)
-    cP, sP = cos(rpitch), sin(rpitch)
-    cR, sR = cos(rroll), sin(rroll)
+    cH, sH = np.cos(rheading), np.sin(rheading)
+    cP, sP = np.cos(rpitch), np.sin(rpitch)
+    cR, sR = np.cos(rroll), np.sin(rroll)
 
     # Rotation matrix (ZYX)
     return np.array([
@@ -663,8 +785,8 @@ def rotate_2d(x, y, angle_deg):
     True
     """
     angle_rad = np.deg2rad(angle_deg)
-    cos_a = cos(angle_rad)
-    sin_a = sin(angle_rad)
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
     return cos_a * x - sin_a * y, sin_a * x + cos_a * y
 
 
@@ -683,7 +805,7 @@ def _assert(cond, txt=''):
 
 
 def spaceline(start_point, stop_point, num=10):
-    '''Return `num` evenly spaced points between start and stop.
+    """Return `num` evenly spaced points between start and stop.
 
     Parameters
     ----------
@@ -709,7 +831,7 @@ def spaceline(start_point, stop_point, num=10):
 
     Examples
     --------
-    >>> import wafo.misc as wm
+    >>> import utilities.numpy_utils as wm
     >>> np.allclose(wm.spaceline((2,0,0), (3,0,0), num=5),
     ...      [[ 2.  ,  0.  ,  0.  ],
     ...       [ 2.25,  0.  ,  0.  ],
@@ -727,7 +849,7 @@ def spaceline(start_point, stop_point, num=10):
     >>> np.allclose(wm.spaceline((2,0,0), (0,0,3), num=1),
     ...      [[ 1.  ,  0.  ,  1.5 ]])
     True
-    '''
+    """
 
     num = int(num)
     if num <= 0:
@@ -754,7 +876,7 @@ def spaceline(start_point, stop_point, num=10):
 
 
 def narg_smallest(arr, n=1):
-    ''' Return the n smallest indices to the arr
+    """ Return the n smallest indices to the arr
 
     Parameters
     ----------
@@ -778,7 +900,7 @@ def narg_smallest(arr, n=1):
     True
     >>> np.allclose(t[ix], [0, 2, 3])
     True
-    '''
+    """
 
     arr = np.asarray(arr).ravel()
     n = int(n)
@@ -793,7 +915,7 @@ def narg_smallest(arr, n=1):
 
 
 def args_flat(*args):
-    '''
+    """
     Return x,y,z positions as a N x 3 ndarray
 
     Parameters
@@ -838,7 +960,7 @@ def args_flat(*args):
     >>> c_shape1 == (1,)
     True
 
-    '''
+    """
     nargin = len(args)
 
     if nargin not in (1, 3):
@@ -869,7 +991,6 @@ def args_flat(*args):
 
 def index2sub(shape, index, order='C'):
     """
-    
     Convert linear indices to subscripts.
 
     Parameters
@@ -1087,7 +1208,7 @@ def moving_average(x, L, axis=0):
     >>> exp = np.exp; cos = np.cos; randn = np.random.randn
 
     >>> x = np.linspace(0,1,200)
-    >>> y = exp(x) + cos(5*2*pi*x) + 1e-1*randn(x.size)
+    >>> y = exp(x) + cos(5*2*np.pi*x) + 1e-1*randn(x.size)
     >>> trend = moving_average(y, 20)
     >>> np.allclose(trend[:4], [ 1.1189971,  1.1189971,  1.1189971,  1.1189971], atol=1e-1)
     True
@@ -1111,7 +1232,7 @@ def moving_average(x, L, axis=0):
     >>> h1 = plt.plot(x, trend, 'r', label='trend')
     >>> h2 = plt.plot(x, exp(x), 'r--', label='true trend')
     >>> h3 = plt.plot(x, periodic, 'm', label='periodic')
-    >>> h4 = plt.plot(x, cos(5*2*pi*x), 'm--', label='true periodic')
+    >>> h4 = plt.plot(x, cos(5*2*np.pi*x), 'm--', label='true periodic')
     >>> h5 = plt.legend()
 
     >>> plt.close('all')
@@ -1296,7 +1417,7 @@ def detrendma(x, L, axis=0):
     >>> x = np.linspace(0,1,200)
     >>> noise = 0.1*randn(x.size)
     >>> noise = 0.1*np.sin(100*x)
-    >>> y = exp(x) + cos(5*2*pi*x) + noise
+    >>> y = exp(x) + cos(5*2*np.pi*x) + noise
     >>> periodic = wm.detrendma(y, 20)
     >>> trend = y - periodic
     >>> np.allclose(trend[:5],
@@ -1314,7 +1435,7 @@ def detrendma(x, L, axis=0):
     >>> h1 = plt.plot(x, trend, 'r', label='trend')
     >>> h2 = plt.plot(x, exp(x), 'r--', label='true trend')
     >>> h3 = plt.plot(x, periodic, 'm', label='periodic')
-    >>> h4 = plt.plot(x, cos(5*2*pi*x), 'm--', label='true periodic')
+    >>> h4 = plt.plot(x, cos(5*2*np.pi*x), 'm--', label='true periodic')
     >>> h5 = plt.legend()
 
     >>> plt.close('all')
@@ -1329,25 +1450,35 @@ def detrendma(x, L, axis=0):
 
 
 def ecross(t, f, ind, v=0):
-    '''
-    Extracts exact level v crossings
-
-    ECROSS interpolates t and f linearly to find the exact level v
-    crossings, i.e., the points where f(t0) = v
+    """
+    Compute exact level crossings by linear interpolation.
 
     Parameters
     ----------
-    t,f : vectors
-        of arguments and functions values, respectively.
-    ind : ndarray of integers
-        indices to level v crossings as found by findcross.
-    v : scalar or vector (of size(ind))
-        defining the level(s) to cross.
+    t, f : array_like
+        Sample locations and corresponding function values.
+    ind : array_like of integers
+        Indices of level crossings, as returned by `findcross`.
+    v : scalar or array_like, optional
+        Crossing level(s). If array-like, must be broadcastable
+        to the shape of the crossing indices.
+
 
     Returns
     -------
-    t0 : vector
-        of  exact level v crossings.
+    t0 : ndarray
+        Interpolated locations where `f` crosses `v`.
+    
+    Notes
+    -----
+    - `ind` is assumed to contain valid crossing intervals such that
+      ``f[ind] != f[ind + 1]``.
+    - The indices in `ind` must satisfy
+      ``0 <= ind < len(f) - 1``.
+
+    See Also
+    --------
+    findcross
 
     Examples
     --------
@@ -1375,44 +1506,55 @@ def ecross(t, f, ind, v=0):
     See also
     --------
     findcross
-    '''
-    # Tested on: Python 2.5
-    # revised pab Feb2004
-    # By pab 18.06.2001
+    """
     return (t[ind] + (v - f[ind]) * (t[ind + 1] - t[ind]) /
             (f[ind + 1] - f[ind]))
 
 
 def findpeaks(data, n=2, min_h=None, min_p=0.0):
-    '''
-    Find peaks of vector or matrix possibly rainflow filtered
+    """
+    Find prominent peaks using rainflow-filtered turning points.
 
     Parameters
     ----------
-    data : matrix or vector
-    n : scalar integer
-         The n highest peaks are found (if exist). (default 2)
-    min_h : real scalar
-        The threshold in the rainflowfilter (default 0.05*range(data.ravel())).
-        A zero value will return all the peaks of data.
-    min_p : 0..1
-        Only the peaks that are higher than min_p*max(max(data))
-        min_p*(the largest peak in data) are returned (default  0).
+    data : array_like
+        One- or two-dimensional input data.
+    n : int, optional
+        Maximum number of peaks to return. Default is 2.
+    min_h : float, optional
+        Rainflow-filter threshold. If None, defaults to
+        ``0.05 * (max(data) - min(data))``.
+        A value of 0 returns all detected peaks.
+    min_p : float, optional
+        Relative peak-height threshold. Only peaks larger than
+        ``min_p * max(data)`` are retained. Default is 0.
 
     Returns
     -------
-    ix : array-like
-        linear index to peaks of data
+    ix : ndarray of int
+        Indices of the detected peaks ordered by descending peak value.
+    
+    Notes
+    -----
+    - For 2-D input, peaks are first identified independently along
+      each row and are then required to exceed neighboring rows at
+      the same column position.
+    - min_p is relative to the global maximum of the entire input
+      array, not the local maximum of each row.
+
+    See Also
+    --------
+    findtp
 
     Examples
     --------
 
-    Find highest 8 peaks that are not
-    less that 0.3*"global max" and have
+    Find highest 8 peaks that are at least
+    0.3 * the global maximum and have a
     rainflow amplitude larger than 5.
     >>> import numpy as np
     >>> import wafo.misc as wm
-    >>> x = np.arange(0,10,0.01)
+    >>> x = np.arange(0, 10, 0.01)
     >>> data = x**2 + 10*np.sin(3*x) + 0.5*np.sin(50*x)
     >>> ind = wm.findpeaks(data, n=8, min_h=5, min_p=0.3)
     >>> np.allclose(ind, [908, 694, 481])
@@ -1425,12 +1567,17 @@ def findpeaks(data, n=2, min_h=None, min_p=0.0):
 
     >>> plt.close('all')
 
-    See also
-    --------
-    findtp
-    '''
+    """
+    if not isinstance(n, numbers.Integral) or n < 1:
+        raise ValueError("n must be a positive integer")
 
     data1 = np.asarray(data, dtype=np.float64)
+    
+    if data1.ndim == 0:
+        raise ValueError("data must be at least one-dimensional")
+    if data1.size == 0:
+        raise ValueError("data must not be empty")
+
     dmax = data1.max()
 
     if min_h is None:
@@ -1439,7 +1586,7 @@ def findpeaks(data, n=2, min_h=None, min_p=0.0):
 
     ndim = data1.ndim
     data2 = np.atleast_2d(data1)
-    nrows, mcols = data2.shape
+    nrows, ncols = data2.shape
 
     ind_p = []
 
@@ -1447,7 +1594,7 @@ def findpeaks(data, n=2, min_h=None, min_p=0.0):
 
         i_tp = findtp(data2[iy], min_h)
 
-        if len(i_tp):
+        if i_tp.size:
             peaks_row = i_tp[1::2]
         else:
             peaks_row = np.array([data2[iy].argmax()], dtype=np.int64)
@@ -1463,17 +1610,17 @@ def findpeaks(data, n=2, min_h=None, min_p=0.0):
                 mask = ((data2[iy, peaks_row] > data2[iy - 1, peaks_row]) &
                         (data2[iy, peaks_row] > data2[iy + 1, peaks_row]))
 
-            ind_p.append(peaks_row[mask] + iy * mcols)
+            ind_p.append(peaks_row[mask] + iy * ncols)
 
     if ndim > 1:
-        ind = np.hstack(ind_p) if len(ind_p) else np.empty(0, dtype=np.int64)
+        ind = np.hstack(ind_p) if ind_p else np.empty(0, dtype=np.int64)
     else:
         ind = np.asarray(ind, dtype=np.int64)
 
     if ind.size == 0:
         return ind
 
-    peaks = data2.ravel()[ind]
+    peaks = np.ravel(data1)[ind]
 
     # filter first
     if min_p > 0:
@@ -1487,36 +1634,44 @@ def findpeaks(data, n=2, min_h=None, min_p=0.0):
 
     return ind[idx[:nmax]]
 
+
 def findtp(x, h=0.0, kind=None,  mode='inclusive'):
-    '''
+    """
     Return indices to turning points (tp) of data, optionally rainflow filtered.
 
     Parameters
     ----------
-    x : vector
-        signal
-    h : real, scalar
-        rainflow threshold
-         if  h<0, then ind = range(len(x))
-         if  h=0, then  tp  is a sequence of turning points (default)
-         if  h>0, then all rainflow cycles with height smaller than
-                  h  are removed.
-    kind : string
-        defines the type of wave or indicate the ASTM rainflow counting method.
-        Possible options are 'astm' 'mw' 'Mw' or 'none'.
-        If None all rainflow filtered min and max
-        will be returned, otherwise only the rainflow filtered
-        min and max, which define a wave according to the
-        wave definition, will be returned.
-    mode : {'inclusive', 'strict'}
+    x : array_like
+        Input signal.
+    h : float, optional
+        Rainflow-filter threshold.
+        - ``h < 0``: return all indices.
+        - ``h = 0``: return turning points.
+        - ``h > 0``: remove rainflow cycles with height smaller than ``h``.
+    kind : {'astm', 'mw', 'Mw', None}, optional
+        Determines which subset of turning points is returned.
+        - None: return all filtered turning points.
+        - 'astm': use ASTM/Nieslony endpoint convention.
+        - 'mw': return turning points defining min-to-max waves.
+        - 'Mw': return turning points defining max-to-min waves.
+    mode : {'inclusive', 'strict'}, optional
         Threshold rule:
         - 'inclusive' : keep cycles with range >= h
         - 'strict'    : keep cycles with range > h
+        Used only when `h > 0` and rainflow filtering is applied.
 
     Returns
     -------
-    ind : array-like
-        indices to the turning points in the original sequence.
+    ind : ndarray of int
+        Indices to the turning points in the original sequence.
+        Returns an empty array if fewer than two extrema are found.
+
+    See Also
+    --------
+    findtc
+    findcross
+    findextrema
+    findrfc
 
     Examples
     --------
@@ -1541,13 +1696,7 @@ def findtp(x, h=0.0, kind=None,  mode='inclusive'):
 
     >>> plt.close('all')
 
-    See also
-    ---------
-    findtc
-    findcross
-    findextrema
-    findrfc
-    '''
+    """
     n = len(x)
     if h < 0.0:
         return np.arange(n)
@@ -1555,7 +1704,7 @@ def findtp(x, h=0.0, kind=None,  mode='inclusive'):
     ind = findextrema(x)
 
     if ind.size < 2:
-        return None
+        return np.empty(0, dtype=np.int64)
 
     # In order to get the exact up-crossing intensity from rfc by
     # mm2lc(tp2mm(rfc))  we have to add the indices
@@ -1578,6 +1727,8 @@ def findtp(x, h=0.0, kind=None,  mode='inclusive'):
 
     if h > 0.0:
         ind1 = findrfc(x[ind], h, mode=mode, assume_tp=True)
+        if ind1.size < 2:
+            return np.empty(0, dtype=np.int64)
         ind = ind[ind1]
 
     if kind in ('mw', 'Mw'):
@@ -1587,7 +1738,7 @@ def findtp(x, h=0.0, kind=None,  mode='inclusive'):
 
         remove_first = xor(first_is_max, kind.startswith('Mw'))
         if remove_first:
-            ind = ind[1::]
+            ind = ind[1:]
 
         # make sure the number of minima and Maxima are according to the
         # wavedef. i.e., make sure Nm=length(ind) is odd
@@ -1598,38 +1749,51 @@ def findtp(x, h=0.0, kind=None,  mode='inclusive'):
 
 def findtc(x_in, v=None, kind=None):
     """
-    Return indices to troughs and crests of data.
+    Return indices to troughs and crests in a signal.
 
     Parameters
     ----------
-    x : vector
-        surface elevation.
-    v : real scalar
-        reference level (default  v = mean of x).
-
-    kind : string
-        defines the type of wave. Possible options are
-        'dw', 'uw', 'tw', 'cw' or None.
-        If None indices to all troughs and crests will be returned,
-        otherwise only the paired ones will be returned
-        according to the wavedefinition.
+    x : array_like
+        Input signal or surface elevation.
+    v : float, optional
+        Reference level. If None, the mean of `x` is used.
+    kind : {'dw', 'uw', 'tw', 'cw', None}, optional
+        If None, indices to all troughs and crests are returned.
+        Otherwise, only paired troughs and crests are returned
+        according to the selected wave definition:
+        - 'dw' : down-crossing wave.
+        - 'uw' : up-crossing wave.
+        - 'tw' : trough-to-trough wave.
+        - 'cw' : crest-to-crest wave.
 
     Returns
+    -------
+    tc_ind : ndarray of int
+        Indices of the trough and crest turning points.
+    v_ind : ndarray of int
+        Indices of the level-`v` crossings in the original sequence.
+
+    Notes
+    -----
+    - The ordering of troughs and crests is determined from the
+      direction of the first level crossing.
+    - Empty arrays are returned if fewer than two valid waves
+      are found.
+
+    See Also
     --------
-    tc_ind : vector of ints
-        indices to the trough and crest turningpoints of sequence x.
-    v_ind : vector of ints
-        indices to the level v crossings of the original
-        sequence x. (d,u)
+    findtp
+    findcross
+    wavedef
 
     Examples
     --------
     >>> import wafo.misc as wm
-    >>> t = np.linspace(0,30,500).reshape((-1,1))
+    >>> t = np.linspace(0, 30, 500).reshape((-1, 1))
     >>> x = np.hstack((t, np.cos(t)))
 
     >>> idtc, idv = wm.findtc(x[:, 1], 0, 'dw')
-    >>> tc = x[idtc,:]
+    >>> tc = x[idtc, :]
     >>> udc = x[idv, :]
     >>> np.allclose(idtc, [52, 105, 157, 209, 261, 314, 366, 418])
     True
@@ -1644,18 +1808,13 @@ def findtc(x_in, v=None, kind=None):
     True
 
     >>> import matplotlib.pyplot as plt
-    >>> h0 = plt.plot(tc[:,0], tc[:,1],'ro', label='trough or crest')
-    >>> h1 = plt.plot(udc[:,0], udc[:,1],'go', label='up or down crossing')
-    >>> h2 = plt.plot(x[:,0], x[:,1], 'k.', label='data')
+    >>> h0 = plt.plot(tc[:, 0], tc[:, 1], 'ro', label='trough or crest')
+    >>> h1 = plt.plot(udc[:, 0], udc[:, 1], 'go', label='up or down crossing')
+    >>> h2 = plt.plot(x[:, 0], x[:, 1], 'k.', label='data')
     >>> h3 = plt.legend()
 
     >>> plt.close('all')
 
-    See also
-    --------
-    findtp
-    findcross,
-    wavedef
     """
 
     x = np.atleast_1d(x_in)
@@ -1666,14 +1825,14 @@ def findtc(x_in, v=None, kind=None):
     n_c = v_ind.size
     if n_c <= 2:
         warnings.warn('There are no waves!')
-        return zeros(0, dtype=int), zeros(0, dtype=int)
+        return np.zeros(0, dtype=int), np.zeros(0, dtype=int)
 
     # determine the number of trough2crest (or crest2trough) cycles
     is_even = np.mod(n_c + 1, 2)
     n_tc = int((n_c - 1 - is_even) / 2)
 
     # allocate variables before the loop increases the speed
-    ind = zeros(n_c - 1, dtype=int)
+    ind = np.zeros(n_c - 1, dtype=int)
 
     first_is_down_crossing = (x[v_ind[0]] > x[v_ind[0] + 1])
     if first_is_down_crossing:
@@ -1697,52 +1856,60 @@ def findtc(x_in, v=None, kind=None):
 
 def findoutliers(x, zcrit=0.0, dcrit=None, ddcrit=None, verbose=False):
     """
-    Return indices to spurious points of data
+    Return indices of spurious points in a signal.
 
     Parameters
     ----------
-    x : vector
-        of data values.
-    zcrit : real scalar
-        critical distance between consecutive points.
-    dcrit : real scalar
-        critical distance of Dx used for determination of spurious
-        points.  (Default 1.5 standard deviation of x)
-    ddcrit : real scalar
-        critical distance of DDx used for determination of spurious
-        points.  (Default 1.5 standard deviation of x)
+    x : array_like
+        Input signal.
+    zcrit : float, optional
+        Critical distance between consecutive points.
+    dcrit : float, optional
+        Critical threshold for first differences (Dx) used to detect 
+        spurious points.  If None, defaults to ``1.5 * std(x)``.
+    ddcrit : float, optional
+        Critical threshold for second differences (D^2x) used to detect 
+        spurious points.  If None, defaults to ``1.5 * std(x)``.
 
     Returns
     -------
-    inds : ndarray of integers
-        indices to spurious points.
-    indg : ndarray of integers
-        indices to the rest of the points.
+    inds : ndarray of int
+        Indices of detected spurious points.
+    indg : ndarray of int
+        Indices of points not classified as spurious.
 
     Notes
     -----
-    Consecutive points less than zcrit apart  are considered as spurious.
-    The point immediately after and before are also removed. Jumps greater than
-    dcrit in Dxn and greater than ddcrit in D^2xn are also considered as
-    spurious.
-    (All distances to be interpreted in the vertical direction.)
-    Another good choice for dcrit and ddcrit are:
+    - Consecutive points whose absolute difference is less than or equal to
+      `zcrit` are considered spurious.
+    - Points associated with first differences exceeding `dcrit` or
+      second differences exceeding `ddcrit` in magnitude are flagged
+      as spurious.
+    - NaN values are always flagged as spurious.
 
-        dcrit = 5*dT  and ddcrit = 9.81/2*dT**2
+    Other useful choices for `dcrit` and `ddcrit` are::
+
+        dcrit = 5 * dT
+        ddcrit = 9.81 / 2 * dT**2
 
     where dT is the timestep between points.
+
+    See Also
+    --------
+    waveplot
+    reconstruct
 
     Examples
     --------
     >>> import numpy as np
     >>> import wafo.misc as wm
-    >>> t = np.linspace(0,30,500).reshape((-1,1))
+    >>> t = np.linspace(0, 30, 500).reshape((-1, 1))
     >>> xx = np.hstack((t, np.cos(t)))
-    >>> dt = np.diff(xx[:2,0])
-    >>> dcrit = 5*dt
-    >>> ddcrit = 9.81/2*dt*dt
+    >>> dt = np.diff(xx[:2, 0])
+    >>> dcrit = 5 * dt
+    >>> ddcrit = 9.81 / 2 * dt * dt
     >>> zcrit = 0
-    >>> inds, indg = wm.findoutliers(xx[:,1], verbose=True)
+    >>> inds, indg = wm.findoutliers(xx[:, 1], verbose=True)
     Found 0 missing points
     dcrit is set to 1.05693
     ddcrit is set to 1.05693
@@ -1755,10 +1922,6 @@ def findoutliers(x, zcrit=0.0, dcrit=None, ddcrit=None, verbose=False):
 
 
     #waveplot(xx,'-',xx(inds,:),1,1,1)
-
-    See also
-    --------
-    waveplot, reconstruct
     """
 
     def _find_nans(xn):
@@ -1803,7 +1966,7 @@ def findoutliers(x, zcrit=0.0, dcrit=None, ddcrit=None, verbose=False):
             return np.hstack((i_step - 1, i_small, i_step, i_step + 1))
         return i_small
 
-    xn = np.asarray(x).flatten()
+    xn = np.ravel(np.asarray(x))
 
     _assert(2 < xn.size, 'The vector must have more than 2 elements!')
 
@@ -1823,15 +1986,16 @@ def findoutliers(x, zcrit=0.0, dcrit=None, ddcrit=None, verbose=False):
     dxn = np.diff(xn)
     ddxn = np.diff(dxn)
 
-    ind = np.hstack((_find_spurious_jumps(dxn, dcrit, name='Dx'),
+    ind = np.hstack((i_missing,
+                     _find_spurious_jumps(dxn, dcrit, name='Dx'),
                      _find_spurious_jumps(ddxn, ddcrit, name='D^2x'),
                      _find_consecutive_equal_values(dxn, zcrit)))
 
-    indg = ones(xn.size, dtype=bool)
+    indg = np.ones(xn.size, dtype=bool)
 
-    if ind.size > 1:
+    if ind.size > 0:
         ind = np.unique(ind)
-        indg[ind] = 0
+        indg[ind] = False
     indg, = np.nonzero(indg)
 
     if verbose:
@@ -1923,33 +2087,40 @@ def argsreduce(condition, *args):
     numpy.extract
     """
 
-s    condition = np.asarray(condition, dtype=bool)
+    condition = np.asarray(condition, dtype=bool)
     condition, *arrays = np.broadcast_arrays(condition, *args)
 
     return tuple(arr[condition] for arr in arrays)
 
 
-    # Ensure boolean condition
-    condition = np.asarray(condition, dtype=bool)
-
-    # Broadcast condition and all args to common shape
-    condition, *arrays = np.broadcast_arrays(condition, *args)
-
-    # Extract values
-    return tuple(np.extract(condition, arr) for arr in arrays)
-
-
-    newargs = np.atleast_1d(*args)
-    if not isinstance(newargs, tuple):
-        newargs = [newargs, ]
-    expand_arr = (condition == condition)
-    return [np.extract(condition, arr1 * expand_arr) for arr1 in newargs]
-
-
 def stirlerr(n):
-    '''
-    Returns error of Stirling approximation,
-        i.e., log(n!) - log( sqrt(2*pi*n)*(n/exp(1))**n )
+    """
+    Return the error term in Stirling's approximation.
+
+    Parameters
+    ----------
+    n : array_like
+        Positive values.
+
+    Returns
+    -------
+    float or ndarray
+        Stirling approximation error. Returns a scalar if
+        the input is scalar.
+
+    Raises
+    ------
+    ValueError
+        If any element of `n` is non-positive.
+    
+    Notes
+    -----
+    Computes
+
+        log(n!) - log(sqrt(2*pi*n) * (n/e)**n)
+
+    using exact evaluation for small/moderate values and
+    asymptotic expansions for larger values.
 
     Examples
     --------
@@ -1958,59 +2129,60 @@ def stirlerr(n):
     True
     >>> np.allclose(wm.stirlerr(5), 0.01664469)
     True
-    >>> np.allclose(wm.stirlerr(8), 0.01041127)
-    True
-    >>> np.allclose(wm.stirlerr(12), 0.00694284)
-    True
-    >>> np.allclose(wm.stirlerr(25), 0.00333316)
-    True
-    >>> np.allclose(wm.stirlerr(70), 0.00119047)
-    True
     >>> np.allclose(wm.stirlerr(100), 0.00083333)
     True
 
 
     See also
     --------
-    binom
+    betaloge
 
 
     References
     ----------
-    Catherine Loader (2000).
-    Fast and Accurate Computation of Binomial Probabilities
+    Catherine Loader (2000),
+    "Fast and Accurate Computation of Binomial Probabilities".
     <http://lists.gnu.org/archive/html/octave-maintainers/2011-09/pdfK0uKOST642.pdf>
-    '''
+    """
+    scalar_input = np.ndim(n) == 0
+    n = np.atleast_1d(np.asarray(n, dtype=np.float64))
 
-    S0 = 0.083333333333333333333  # /* 1/12 */
-    S1 = 0.00277777777777777777778  # /* 1/360 */
-    S2 = 0.00079365079365079365079365  # /* 1/1260 */
-    S3 = 0.000595238095238095238095238  # /* 1/1680 */
-    S4 = 0.0008417508417508417508417508  # /* 1/1188 */
+    if np.any(n <= 0):
+        raise ValueError("All values of n must be positive.")
 
-    n1 = np.atleast_1d(n)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        y = gammaln(n1 + 1) - log(sqrt(2 * pi * n1) * (n1 / exp(1)) ** n1)
+    # Bernoulli-series coefficients
+    S0 = 1.0 / 12.0
+    S1 = 1.0 / 360.0
+    S2 = 1.0 / 1260.0
+    S3 = 1.0 / 1680.0
+    S4 = 1.0 / 1188.0
 
-    nn = n1 * n1
+    # Exact calculation for smaller values.
+    # Written in log form to avoid overflow.
+    y = gammaln(n + 1.0) - (0.5 * np.log(2.0 * np.pi * n) + n * (np.log(n) - 1.0))
 
-    n500 = 500 < n1
-    y[n500] = (S0 - S1 / nn[n500]) / n1[n500]
-    n80 = np.logical_and(80 < n1, n1 <= 500)
-    if np.any(n80):
-        y[n80] = (S0 - (S1 - S2 / nn[n80]) / nn[n80]) / n1[n80]
-    n35 = np.logical_and(35 < n1, n1 <= 80)
-    if np.any(n35):
-        nn35 = nn[n35]
-        y[n35] = (S0 - (S1 - (S2 - S3 / nn35) / nn35) / nn35) / n1[n35]
+    nn = n * n
 
-    n15 = np.logical_and(15 < n1, n1 <= 35)
-    if np.any(n15):
-        nn15 = nn[n15]
-        y[n15] = (
-            S0 - (S1 - (S2 - (S3 - S4 / nn15) / nn15) / nn15) / nn15) / n1[n15]
+    # Loader-recommended asymptotic approximations
+    mask = n > 500
+    y[mask] = (S0 - S1 / nn[mask]) / n[mask]
 
+    mask = (n > 80) & (n <= 500)
+    if np.any(mask):
+        y[mask] = (S0 - (S1 - S2 / nn[mask]) / nn[mask]) / n[mask]
+
+    mask = (n > 35) & (n <= 80)
+    if np.any(mask):
+        nn_m = nn[mask]
+        y[mask] = (S0 - (S1 - (S2 - S3 / nn_m) / nn_m) / nn_m) / n[mask]
+
+    mask = (n > 15) & (n <= 35)
+    if np.any(mask):
+        nn_m = nn[mask]
+        y[mask] = (S0 - (S1 - (S2 - (S3 - S4 / nn_m) / nn_m ) / nn_m ) / nn_m ) / n[mask]
+
+    if scalar_input:
+        return y.item()
     return y
 
 
@@ -2122,140 +2294,240 @@ def getshipchar(**ship_property):
     return shipchar
 
 
-def binomln(z, w):
-    '''
-    Natural Logarithm of binomial coefficient.
+def _betaln_asymptotic(a, b):
+    """
+    Asymptotic approximation to log(Beta(a, b)).
 
-    CALL binomln(z,w)
+    Assumes
+        10 <= a <= b < np.finfo(float).max
 
-    BINOMLN computes the natural logarithm of the binomial
-    function for corresponding elements of Z and W.   The arrays Z and
-    W must be real and nonnegative. Both arrays must be the same size,
-    or either can be scalar.  BINOMLN is defined as:
-
-    y = LOG(binom(Z,W)) = gammaln(Z)-gammaln(W)-gammaln(Z-W)
-
-    and is obtained without computing BINOM(Z,W). Since the binom
-    function can range over very large or very small values, its
-    logarithm is sometimes more useful.
-    This implementation is more accurate than the log(BINOM(Z,W) implementation
-    for large arguments
-
-    Examples
-    --------
-
-    >>> np.allclose(binomln(3,2), 1.09861229)
-    True
-
-    See also
-    --------
-    binom
-    '''
-
-    # return gammaln(z+1.) - gammaln(w+1.) - gammaln(z-w+1.)
-    zmw = z-w
-    k = np.where(zmw < 2, zmw, w)
-    out = -log(z + 1.) - betaloge(z - k + 1., k + 1.)
-    if np.isscalar(zmw):
-        if k < 2:
-            if k < 0:
-                return -np.inf
-            if k == 0:
-                return 0.0
-            if k == 1:
-                return log(z)
-    else:
-        n = np.broadcast_to(z, np.shape(k))
-        out[k < 0] = -np.inf
-        out[k == 0] = 0.0
-        out[k == 1] = log(n[k == 1])
-    return out
-
-
-def _betaln3(a, b):
-    """ Returns betaln valid for huge arguments: 10 <= a  and b < huge
-
-    More accurate than special.betaln
+    and is typically more accurate than scipy.special.betaln
+    for very large arguments.
     """
     apb = a + b
+
     corr = stirlerr(a) + stirlerr(b) - stirlerr(apb)
-    return (- 0.5 * log(b) + 0.5 * log(2 * pi) + corr
-            + (a - 0.5) * log(a/apb) + b * log1p(-a/apb))
+
+    return (
+        -0.5 * np.log(b)
+        + 0.5 * np.log(2.0 * np.pi)
+        + corr
+        + (a - 0.5) * np.log(a / apb)
+        + b * np.log1p(-a / apb)
+    )
 
 
 def betaloge(z, w):
-    '''
-    Natural Logarithm of beta function.
+    """
+    Natural logarithm of the beta function.
 
-    CALL betaloge(z,w)
+    Parameters
+    ----------
+    z, w : array_like
+        Non-negative real values. Inputs are broadcast according
+        to NumPy broadcasting rules.
 
-    BETALOGE computes the natural logarithm of the beta
-    function for corresponding elements of Z and W.   The arrays Z and
-    W must be real and nonnegative. Both arrays must be the same size,
-    or either can be scalar.  BETALOGE is defined as:
+    Returns
+    -------
+    float or ndarray
+        log(beta(z, w)).
+        Returns a scalar when both inputs are scalars.
 
-    y = LOG(BETA(Z,W)) = gammaln(Z)+gammaln(W)-gammaln(Z+W)
+    Notes
+    -----
+    Computes
 
-    and is obtained without computing BETA(Z,W). Since the beta
-    function can range over very large or very small values, its
-    logarithm is sometimes more useful.
-    This implementation is more accurate than the BETALN implementation
-    for large arguments
+        log(beta(z, w))
+
+    without first evaluating beta(z, w), avoiding overflow
+    and underflow issues.
+
+    For large arguments an asymptotic expansion due to Loader
+    is used, which can be more accurate than scipy.special.betaln.
+
+    The beta function satisfies
+
+        beta(z, w)
+            = gamma(z) * gamma(w) / gamma(z + w)
+
+    so that
+
+        log(beta(z, w))
+            = gammaln(z) + gammaln(w) - gammaln(z + w)
+
+    References
+    ----------
+    Catherine Loader (2000),
+    "Fast and Accurate Computation of Binomial Probabilities".
 
     Examples
     --------
-    >>> import wafo.misc as wm
+    >>> import utilities.numpy_utils as wm
     >>> np.allclose(wm.betaloge(3,2), -2.48490665)
     True
 
     See also
     --------
-    betaln, beta
-    '''
-    huge = FLOATINFO.max
+    betaln
+    beta
+    """
+    scalar_input = np.ndim(z) == 0 and np.ndim(w) == 0
+
+    z, w = np.broadcast_arrays(
+        np.asarray(z, dtype=np.float64),
+        np.asarray(w, dtype=np.float64)
+    )
+
     a = np.minimum(z, w)
     b = np.maximum(z, w)
-    out = np.full(b.shape, np.nan, dtype=float)
-    r00 = (a == 0)
-    out[r00] = np.inf
-    r01 = (0 < a) & (huge <= b)
-    out[r01] = -np.inf
-    r_3 = (10 <= a) & (b < huge)
-    if np.any(r_3):
-        out[r_3] = _betaln3(a[r_3], b[r_3])
-    r12 = (0 < a) & (a < 10) & (b < huge)
-    if np.any(r12):
-        out[r12] = betaln(a[r12], b[r12])
-    return out
+
+    out = np.full(a.shape, np.nan, dtype=np.float64)
+
+    huge = np.finfo(np.float64).max
+
+    # beta(0, x) = inf
+    zero_mask = (a == 0)
+    out[zero_mask] = np.inf
+
+    # Invalid domain
+    invalid_mask = (a < 0) | (b < 0)
+    out[invalid_mask] = np.nan
+
+    # Extremely large values
+    overflow_mask = ((a > 0) & (b >= huge))
+    out[overflow_mask] = -np.inf
+
+    # Loader asymptotic approximation
+    asymptotic_mask = ((a >= 10) & (b < huge))
+
+    if np.any(asymptotic_mask):
+        out[asymptotic_mask] = _betaln_asymptotic(a[asymptotic_mask], b[asymptotic_mask])
+
+    # Default scipy implementation
+    standard_mask = ((a > 0) & (a < 10) & (b < huge))
+
+    if np.any(standard_mask):
+        out[standard_mask] = betaln(a[standard_mask], b[standard_mask])
+
+    return out.item() if scalar_input else out
 
 
-def gravity(phi=45):
-    ''' Returns the constant acceleration of gravity
-
-    GRAVITY calculates the acceleration of gravity
-    using the international gravitational formulae [1]_:
-
-      g = 9.78049*(1+0.0052884*sin(phir)**2-0.0000059*sin(2*phir)**2)
-    where
-      phir = phi*pi/180
+def binomln(z, w):
+    """
+    Natural logarithm of the binomial coefficient.
 
     Parameters
     ----------
-    phi : {float, int}
-         latitude in degrees
+    z, w : array_like
+        Real-valued arguments. Inputs are broadcast according
+        to NumPy broadcasting rules.
 
     Returns
+    -------
+    float or ndarray
+        Natural logarithm of the binomial coefficient.
+
+    Notes
+    -----
+    Computes
+
+        log(binom(z, w))
+
+    without first evaluating the binomial coefficient itself,
+    avoiding overflow and underflow for large arguments.
+
+    The implementation uses the identity
+
+        binom(z, w)
+            = 1 / ((z + 1) * beta(z - k + 1, k + 1))
+
+    where
+
+        k = min(w, z - w)
+
+    to improve numerical accuracy.
+
+    For integer arguments, values with
+
+        w < 0 or w > z
+
+    return ``-np.inf``.
+
+    Examples
     --------
-    g : ndarray
-        acceleration of gravity [m/s**2]
+    >>> np.allclose(binomln(3, 2), np.log(3))
+    True
+
+    >>> binomln(5, 0)
+    0.0
+
+    >>> binomln(3, 5)
+    -inf
+
+    See Also
+    --------
+    betaloge
+    scipy.special.binom
+    """
+    scalar_input = np.ndim(z) == 0 and np.ndim(w) == 0
+
+    z, w = np.broadcast_arrays(
+        np.atleast_1d(np.asarray(z, dtype=np.float64)),
+        np.asarray(w, dtype=np.float64)
+    )
+
+    # Exploit symmetry:
+    # binom(z, w) = binom(z, z - w)
+    k = np.minimum(w, z - w)
+
+    out = (
+        -np.log(z + 1.0)
+        - betaloge(z - k + 1.0, k + 1.0)
+    )
+
+    out[k < 0] = -np.inf
+    out[k == 0] = 0.0
+
+    mask = (k == 1)
+    if np.any(mask):
+        out[mask] = np.log(z[mask])
+
+    return out.item() if scalar_input else out
+
+
+def gravity(phi=45):
+    """
+    Return the acceleration due to gravity.
+
+    The acceleration is computed using the International
+    Gravity Formula [1]_:
+
+        g = 9.78049 * (
+            1 + 0.0052884 * sin(phi)**2
+              - 0.0000059 * sin(2*phi)**2
+        )
+
+    where ``phi`` is the latitude in radians.
+
+    Parameters
+    ----------
+    phi : array_like, optional
+        Latitude in degrees. Default is 45.
+
+    Returns
+    -------
+    float or ndarray
+        Acceleration due to gravity [m/s**2].
 
     Examples
     --------
     >>> import wafo.misc as wm
     >>> import numpy as np
-    >>> phi = np.linspace(0,45,5)
-    >>> np.allclose(wm.gravity(phi),
-    ...            [ 9.78049   ,  9.78245014,  9.78803583, 9.79640552,  9.80629387])
+    >>> phi = np.linspace(0, 45, 5)
+    >>> np.allclose(
+    ...     wm.gravity(phi),
+    ...     [9.78049, 9.78245014, 9.78803583, 9.79640552, 9.80629387]
+    ... )
     True
 
     See also
@@ -2270,57 +2542,85 @@ def gravity(phi=45):
             tapir forlag, University of Trondheim,
             ISBN 82-519-0786-1, pp 19
 
-    '''
+    """
+    phi_rad = np.deg2rad(phi)
 
-    phir = phi * pi / 180.  # change from degrees to radians
-    return 9.78049 * (1. + 0.0052884 * sin(phir) ** 2.
-                      - 0.0000059 * sin(2 * phir) ** 2.)
+    return (
+        9.78049
+        * (
+            1.0
+            + 0.0052884 * np.sin(phi_rad) ** 2
+            - 0.0000059 * np.sin(2.0 * phi_rad) ** 2
+        )
+    )
 
 
 def nextpow2(x):
-    '''
-    Return next higher power of 2
+    """
+    Return the exponent of the next higher power of two.
+
+    For scalar inputs, returns the smallest integer ``n`` such that
+
+        2**n >= abs(x)
+
+    For array-like inputs, the length of the input is used.
+
+    Parameters
+    ----------
+    x : scalar or array_like
+        Input value or sequence.
+
+    Returns
+    -------
+    int
+        Exponent of the next higher power of two.
 
     Examples
     --------
     >>> import wafo.misc as wm
-    >>> np.allclose(wm.nextpow2(10), 4)
-    True
-    >>> np.allclose(wm.nextpow2(np.arange(5)), 3)
-    True
-    '''
-    t = np.isscalar(x) or len(x)
-    if t > 1:
-        f, n = np.frexp(t)
+    >>> wm.nextpow2(10)
+    4
+
+    >>> wm.nextpow2(8)
+    3
+
+    >>> wm.nextpow2(np.arange(5))
+    3
+    """
+    if np.isscalar(x):
+        value = abs(x)
     else:
-        f, n = np.frexp(np.abs(x))
+        value = len(x)
 
-    if f == 0.5:
-        n = n - 1
-    return n
+    if value <= 1:
+        return 0
+
+    return int(np.ceil(np.log2(value)))
 
 
-def discretize(fun, a, b, tol=0.005, n=5, method='linear'):
-    '''
-    Automatic discretization of function
+def discretize(fun, a, b, tol=0.005, n=5, method="linear"):
+    """
+    Automatically discretize a function on an interval.
 
     Parameters
     ----------
     fun : callable
-        function to discretize
-    a, b : real scalars
-        evaluation limits
-    tol : real, scalar
-        absoute error tolerance
-    n : scalar integer
-        number of values to start the discretization with.
-    method : string
-        defining method of gridding, options are 'linear' and 'adaptive'
+        Function to evaluate.
+    a, b : float
+        Interval endpoints.
+    tol : float, optional
+        Error tolerance.
+    n : int, optional
+        Initial number of points.
+    method : {"linear", "adaptive"}, optional
+        Refinement strategy.
 
     Returns
     -------
-    x : discretized values
-    y : fun(x)
+    x : ndarray
+        Grid points.
+    y : ndarray
+        Function values.
 
     Examples
     --------
@@ -2346,92 +2646,188 @@ def discretize(fun, a, b, tol=0.005, n=5, method='linear'):
     >>> h2 = plt.legend()
 
     >>> plt.close('all')
+    """
+    if not callable(fun):
+        raise TypeError("fun must be callable")
 
-    '''
-    if method.startswith('a'):
+    if tol <= 0:
+        raise ValueError("tol must be positive")
+
+    if n < 3:
+        raise ValueError("n must be at least 3")
+
+    method = method.lower()
+
+    if method == "adaptive":
         return _discretize_adaptive(fun, a, b, tol, n)
-    return _discretize_linear(fun, a, b, tol, n)
+
+    if method == "linear":
+        return _discretize_linear(fun, a, b, tol, n)
+
+    raise ValueError(
+        "method must be 'linear' or 'adaptive'"
+    )
 
 
 def _discretize_linear(fun, a, b, tol=0.005, n=5):
-    '''
-    Automatic discretization of function, linear gridding
-    '''
+    """
+    Automatically discretize a function using uniform refinement.
+
+    The interval is repeatedly refined by inserting midpoints
+    until the interpolation error falls below `tol` or a
+    maximum number of refinement attempts is reached.
+    """
+    MAX_POINTS = 2**20
+    MAX_STAGNATION = 5
+
     x = np.linspace(a, b, n)
     y = fun(x)
 
-    err0 = inf
-    err = 10000
-    nmax = 2 ** 20
-    num_tries = 0
-    while num_tries < 5 and err > tol and n < nmax:
-        err0 = err
-        x0 = x
-        y0 = y
+    err = np.inf
+    stagnation_count = 0
+
+    while (
+        stagnation_count < MAX_STAGNATION
+        and err > tol
+        and n < MAX_POINTS
+    ):
+        previous_err = err
+
+        x_old = x
+        y_old = y
+
         n = 2 * (n - 1) + 1
+
         x = np.linspace(a, b, n)
         y = fun(x)
-        y00 = np.interp(x, x0, y0)
-        err = 0.5 * np.amax(np.abs(y00 - y) / (np.abs(y00) + np.abs(y) + _TINY + tol))
-        num_tries += int(abs(err - err0) <= tol / 2)
+
+        y_interp = np.interp(x, x_old, y_old)
+
+        err = (
+            0.5
+            * np.max(
+                np.abs(y_interp - y)
+                / (np.abs(y_interp) + np.abs(y) + _TINY + tol)
+            )
+        )
+
+        if abs(err - previous_err) <= tol / 2:
+            stagnation_count += 1
+
     return x, y
 
 
 def _discretize_adaptive(fun, a, b, tol=0.005, n=5):
-    '''
-    Automatic discretization of function, adaptive gridding.
-    '''
-    n += (np.mod(n, 2) == 0)  # make sure n is odd
+    """
+    Automatically discretize a function using adaptive gridding.
+
+    The grid is refined only in intervals where the interpolation
+    error exceeds the specified tolerance.
+    """
+    MAX_ITERATIONS = 50
+    MAX_STAGNATION = 5
+
+    # Ensure an odd number of initial points.
+    if n % 2 == 0:
+        n += 1
+
     x = np.linspace(a, b, n)
     fx = fun(x)
 
-    n2 = (n - 1) // 2
-    erri = np.hstack((zeros((n2, 1)), ones((n2, 1)))).ravel()
-    err = erri.max()
-    err0 = inf
-    num_tries = 0
-    # reltol = abstol = tol
-    for j in range(50):
-        if num_tries < 5 and err > tol:
-            err0 = err
-            # find top errors
+    n_intervals = (n - 1) // 2
 
-            ix, = np.where(erri > tol)
-            # double the sample rate in intervals with the most error
-            y = (np.vstack(((x[ix] + x[ix - 1]) / 2,
-                            (x[ix + 1] + x[ix]) / 2)).T).ravel()
-            fy = fun(y)
-            fy0 = np.interp(y, x, fx)
+    # NOTE:
+    # The shape and ordering of interval_error are important.
+    # Do not replace this with a simpler-looking construction.
+    interval_error = np.hstack(
+        (
+            np.zeros((n_intervals, 1)),
+            np.ones((n_intervals, 1)),
+        )
+    ).ravel()
 
-            abserr = np.abs(fy0 - fy)
-            erri = 0.5 * (abserr / (np.abs(fy0) + np.abs(fy) + _TINY + tol))
-            # converged = abserr <= np.maximum(abseps, releps * abs(fy))
-            # converged = abserr <= np.maximum(tol, tol * abs(fy))
-            err = erri.max()
+    error = interval_error.max()
+    stagnation_count = 0
 
-            x = np.hstack((x, y))
+    for iteration in range(MAX_ITERATIONS):
 
-            ix = x.argsort()
-            x = x[ix]
-            erri = np.hstack((zeros(len(fx)), erri))[ix]
-            fx = np.hstack((fx, fy))[ix]
-            num_tries += int(abs(err - err0) <= tol / 2)
-        else:
+        if error <= tol or stagnation_count >= MAX_STAGNATION:
             break
+
+        previous_error = error
+
+        # Intervals requiring refinement.
+        refine_idx, = np.where(interval_error > tol)
+
+        # Insert midpoints on both sides of each interval.
+        x_new = np.vstack(
+            (
+                (x[refine_idx] + x[refine_idx - 1]) / 2.0,
+                (x[refine_idx + 1] + x[refine_idx]) / 2.0,
+            )
+        ).T.ravel()
+
+        f_new = fun(x_new)
+
+        # Interpolated values based on the current grid.
+        f_interp = np.interp(x_new, x, fx)
+
+        abs_error = np.abs(f_interp - f_new)
+
+        interval_error = (
+            0.5
+            * abs_error
+            / (np.abs(f_interp) + np.abs(f_new) + _TINY + tol)
+        )
+
+        error = interval_error.max()
+
+        # Merge and sort the refined grid.
+        x = np.hstack((x, x_new))
+        order = np.argsort(x)
+
+        x = x[order]
+
+        # IMPORTANT:
+        # Preserve the original mapping between interval_error
+        # and grid locations.
+        interval_error = np.hstack(
+            (np.zeros(len(fx)), interval_error)
+        )[order]
+
+        fx = np.hstack((fx, f_new))[order]
+
+        if abs(error - previous_error) <= tol / 2:
+            stagnation_count += 1
+
     else:
-        warnings.warn('Recursion level limit reached j=%d' % j)
+        warnings.warn(
+            f"Maximum refinement iterations ({MAX_ITERATIONS}) reached."
+        )
 
     return x, fx
 
 
 def polar2cart(theta, rho, z=None):
-    '''
-    Transform polar coordinates into 2D cartesian coordinates.
+    """
+    Transform polar coordinates to Cartesian coordinates.
+
+    Parameters
+    ----------
+    theta : array_like
+        Polar angle in radians.
+    rho : array_like
+        Radial distance.
+    z : array_like, optional
+        Optional z-coordinate. Returned unchanged.
 
     Returns
     -------
-    x, y : array-like
-        Cartesian coordinates, x = rho*cos(theta), y = rho*sin(theta)
+    x, y : ndarray or scalar
+        Cartesian coordinates.
+
+    x, y, z : ndarray or scalar
+        Returned when `z` is supplied.
 
     Examples
     --------
@@ -2443,10 +2839,13 @@ def polar2cart(theta, rho, z=None):
     See also
     --------
     cart2polar
-    '''
-    x, y = rho * cos(theta), rho * sin(theta)
+    """
+    x = rho * np.cos(theta)
+    y = rho * np.sin(theta)
+
     if z is None:
         return x, y
+
     return x, y, z
 
 
@@ -2454,14 +2853,22 @@ pol2cart = polar2cart
 
 
 def cart2polar(x, y, z=None):
-    ''' Transform 2D cartesian coordinates into polar coordinates.
+    """
+    Transform Cartesian coordinates to polar coordinates.
+
+    Parameters
+    ----------
+    x, y : array_like
+        Cartesian coordinates.
+    z : array_like, optional
+        Optional z-coordinate. Returned unchanged.
 
     Returns
     -------
-    theta : array-like
-        radial angle, arctan2(y,x)
-    rho : array-like
-        radial distance, sqrt(x**2+y**2)
+    theta : ndarray or scalar
+        Polar angle in radians.
+    rho : ndarray or scalar
+        Radial distance.
 
     Examples
     --------
@@ -2473,11 +2880,14 @@ def cart2polar(x, y, z=None):
     See also
     --------
     polar2cart
-    '''
-    t, r = arctan2(y, x), np.hypot(x, y)
+    """
+    theta = np.arctan2(y, x)
+    rho = np.hypot(x, y)
+
     if z is None:
-        return t, r
-    return t, r, z
+        return theta, rho
+
+    return theta, rho, z
 
 
 cart2pol = cart2polar
@@ -2485,12 +2895,17 @@ cart2pol = cart2polar
 
 def ndgrid(*args, **kwargs):
     """
-    Same as calling meshgrid with indexing='ij' (see meshgrid for
-    documentation).
+    Return coordinate matrices using matrix ('ij') indexing.
+
+    Equivalent to::
+
+        np.meshgrid(*args, indexing='ij', **kwargs)
+
+    This provides MATLAB-compatible ``ndgrid`` behavior.
 
     Examples
     --------
-    >>> x, y = ndgrid([1,2,3],[4,5,6])
+    >>> x, y = ndgrid([1, 2, 3], [4, 5, 6])
     >>> np.allclose(x, [[1, 1, 1],
     ...                 [2, 2, 2],
     ...                 [3, 3, 3]])
@@ -2500,96 +2915,152 @@ def ndgrid(*args, **kwargs):
     ...                 [4, 5, 6]])
     True
     """
-    kwargs['indexing'] = 'ij'
-    return meshgrid(*args, **kwargs)
+    if "indexing" in kwargs:
+        raise TypeError(
+            "ndgrid always uses indexing='ij'"
+        )
+
+    return np.meshgrid(*args, indexing="ij", **kwargs)
 
 
-def trangood(x, f, min_n=None, min_x=None, max_x=None, max_n=inf):
+def trangood(x, f, min_n=None, min_x=None, max_x=None, max_n=np.inf):
     """
-    Make sure transformation is efficient.
+    Ensure a transformation is represented on a uniformly spaced grid.
 
     Parameters
-    ------------
+    ----------
     x, f : array_like
-        input transform function, (x,f(x)).
-    min_n : scalar, int
-        minimum number of points in the good transform.
-               (Default  x.shape[0])
-    min_x : scalar, real
-        minimum x value to transform. (Default  min(x))
-    max_x : scalar, real
-        maximum x value to transform. (Default  max(x))
-    max_n : scalar, int
-        maximum number of points in the good transform
-              (default inf)
+        Transform function represented by the pairs ``(x, f(x))``.
+    min_n : int, optional
+        Minimum number of points in the returned transform.
+        Default is ``len(x)``.
+    min_x : float, optional
+        Minimum x-value in the returned transform.
+        Default is ``min(x)``.
+    max_x : float, optional
+        Maximum x-value in the returned transform.
+        Default is ``max(x)``.
+    max_n : int, optional
+        Maximum number of points in the returned transform.
+        Default is ``np.inf``.
+
     Returns
     -------
-    x, f : array_like
-        the good transform function.
+    x : ndarray
+        Uniformly spaced x-values.
+    f : ndarray
+        Function values corresponding to x.
 
     Notes
     -----
-    TRANGOOD interpolates f linearly  and optionally
-    extrapolate it linearly outside the range of x
-    with X uniformly spaced.
+    The transform is linearly interpolated onto a uniform grid
+    when necessary. Optionally, it is linearly extrapolated
+    outside the original range.
 
     See also
     ---------
-    tranproc,
+    tranproc
     numpy.interp
     """
-    xo, fo = np.atleast_1d(x, f)
+    x_uniform, f_uniform = np.atleast_1d(x, f)
 
-    _assert(xo.ndim == 1, 'x must be a vector.')
-    _assert(fo.ndim == 1, 'f  must be a vector.')
+    _assert(x_uniform.ndim == 1, "x must be a vector.")
+    _assert(f_uniform.ndim == 1, "f must be a vector.")
+    _assert(len(x_uniform) == len(f_uniform),
+            "x and f must have the same length.")
+    _assert(len(x_uniform) >= 2, "At least two points are required.")
 
-    i = xo.argsort()
-    xo, fo = xo[i], fo[i]
-    del i
-    dx = np.diff(xo)
-    _assert(all(dx > 0), 'Duplicate x-values not allowed.')
+    # Sort by x values.
+    order = np.argsort(x_uniform)
+    x_uniform = x_uniform[order]
+    f_uniform = f_uniform[order]
 
-    nf = fo.shape[0]
+    spacing = np.diff(x_uniform)
 
-    max_x = xo[-1] if max_x is None else max_x
-    min_x = xo[0] if min_x is None else min_x
-    min_n = nf if min_n is None else min_n
-    min_n = max(min_n, 2)
-    max_n = max(max_n, 2)
+    _assert(
+        np.all(spacing > 0),
+        "Duplicate x-values not allowed."
+    )
 
-    ddx = np.diff(dx)
-    xn = xo[-1]
-    x0 = xo[0]
-    L = float(xn - x0)
-    if nf < min_n or max_n < nf or np.any(np.abs(ddx) > 10 * _EPS * L):
-        # pab 07.01.2001: Always choose the stepsize df so that
-        # it is an exactly representable number.
-        # This is important when calculating numerical derivatives and is
-        # accomplished by the following.
-        dx = L / (min(min_n, max_n) - 1)
-        dx = (dx + 2.) - 2.
-        xi = np.arange(x0, xn + dx / 2., dx)
-        # New call pab 11.11.2000: This is much quicker
-        fo = np.interp(xi, xo, fo)
-        xo = xi
+    n_points = len(f_uniform)
 
-    # x is now uniformly spaced
-    dx = xo[1] - xo[0]
+    min_x = x_uniform[0] if min_x is None else min_x
+    max_x = x_uniform[-1] if max_x is None else max_x
+    min_n = n_points if min_n is None else min_n
 
-    # Extrapolate linearly outside the range of ff
-    if min_x < xo[0]:
-        x1 = dx * np.arange(np.floor((min_x - xo[0]) / dx), -2)
-        f2 = fo[0] + x1 * (fo[1] - fo[0]) / (xo[1] - xo[0])
-        fo = np.hstack((f2, fo))
-        xo = np.hstack((x1 + xo[0], xo))
+    min_n = int(max(min_n, 2))
+    if np.isfinite(max_n):
+        max_n = int(max(max_n, 2))
 
-    if max_x > xo[-1]:
-        x1 = dx * np.arange(1, np.ceil((max_x - xo[-1]) / dx) + 1)
-        f2 = f[-1] + x1 * (f[-1] - f[-2]) / (xo[-1] - xo[-2])
-        fo = np.hstack((fo, f2))
-        xo = np.hstack((xo, x1 + xo[-1]))
+    _assert(min_n <= max_n, "min_n must not exceed max_n.")
 
-    return xo, fo
+    domain_length = float(x_uniform[-1] - x_uniform[0])
+
+    spacing_change = np.diff(spacing)
+    uniformity_tol = 10 * _EPS * domain_length
+
+    too_few_points = n_points < min_n
+    too_many_points = n_points > max_n
+    nonuniform_grid = np.any(np.abs(spacing_change) > uniformity_tol)
+
+    if too_few_points or too_many_points or nonuniform_grid:
+
+        resample_n = int(min(min_n, max_n))
+
+        uniform_spacing = domain_length / (resample_n - 1)
+
+        # Preserve legacy behavior:
+        # force step size to be exactly representable.
+        uniform_spacing = (uniform_spacing + 2.0) - 2.0
+
+        new_x = np.arange(
+            x_uniform[0],
+            x_uniform[-1] + uniform_spacing / 2.0,
+            uniform_spacing
+        )
+
+        f_uniform = np.interp(
+            new_x,
+            x_uniform,
+            f_uniform
+        )
+
+        x_uniform = new_x
+
+    # Grid is now uniform.
+    uniform_spacing = x_uniform[1] - x_uniform[0]
+
+    # Extend left side if requested.
+    if min_x < x_uniform[0]:
+        n_left = int(np.ceil((x_uniform[0] - min_x) / uniform_spacing))
+        offsets = uniform_spacing * np.arange(-n_left, 0)
+
+        extrapolated_f = (
+            f_uniform[0]
+            + offsets
+            * (f_uniform[1] - f_uniform[0])
+            / uniform_spacing
+        )
+
+        f_uniform = np.hstack((extrapolated_f, f_uniform))
+        x_uniform = np.hstack((x_uniform[0] + offsets, x_uniform))
+
+    # Extend right side if requested.
+    if max_x > x_uniform[-1]:
+        n_right = int(np.ceil((max_x - x_uniform[-1]) / uniform_spacing))
+        offsets = uniform_spacing * np.arange(1, n_right + 1)
+
+        extrapolated_f = (
+            f_uniform[-1]
+            + offsets
+            * (f_uniform[-1] - f_uniform[-2])
+            / uniform_spacing
+        )
+
+        f_uniform = np.hstack((f_uniform, extrapolated_f))
+        x_uniform = np.hstack((x_uniform, x_uniform[-1] + offsets))
+
+    return x_uniform, f_uniform
 
 
 def tranproc(x, f, x0, *xi):
@@ -2605,9 +3076,15 @@ def tranproc(x, f, x0, *xi):
 
     Returns
     -------
-    y0, y1,...,yn : vectors
-        where yi is the i'th time derivative of y0 = f(x0).
+    y0 : ndarray
+        Returned when no derivatives are supplied.
 
+    [y0, y1, ..., yn] : list of ndarray
+        Returned when derivatives are supplied.
+        Here yi is the i'th time derivative of y0 = f(x0).
+
+    Notes
+    -----
     By the basic rules of derivation:
     Y1 = f'(X0)*X1
     Y2 = f''(X0)*X1^2 + f'(X0)*X2
@@ -2651,7 +3128,8 @@ def tranproc(x, f, x0, *xi):
     """
     def _default_step(xo, num_derivatives):
         hn = xo[1] - xo[0]
-        if hn ** num_derivatives < sqrt(_EPS):
+        derivative_resolution = hn ** num_derivatives
+        if derivative_resolution < np.sqrt(_EPS):
             msg = ('Numerical problems may occur for the derivatives in ' +
                    'tranproc.\n' +
                    'The sampling of the transformation may be too small.')
@@ -2660,13 +3138,16 @@ def tranproc(x, f, x0, *xi):
 
     def _diff(xo, fo, x0, num_derivatives):
         hn = _default_step(xo, num_derivatives)
-        # Transform X with the derivatives of  f.
+        # Compute successive numerical derivatives of f.
         fder = np.vstack((xo, fo))
         fxder = np.zeros((num_derivatives, x0.size))
         for k in range(num_derivatives):  # Derivation of f(x) using a difference method.
             n = fder.shape[-1]
             fder = np.vstack([(fder[0, 0:n - 1] + fder[0, 1:n]) / 2,
                               np.diff(fder[1, :]) / hn])
+            # Evaluate the kth derivative of f at x0.
+            # No derivative arguments are supplied, so tranproc
+            # returns only the interpolated values.
             fxder[k] = tranproc(fder[0], fder[1], x0)
         return fxder
 
@@ -2692,31 +3173,35 @@ def tranproc(x, f, x0, *xi):
         """
         return (fxder[3] * xi[0] ** 4. + fxder[0] * xi[3] +
                 6. * fxder[2] * xi[0] ** 2. * xi[1] +
-                fxder[1] * (3. * xi[1] ** 2. + 4. * xi[0] * xi[1]))
+                fxder[1] * (3. * xi[1] ** 2. + 4. * xi[0] * xi[2]))
 
     xo, fo, x0 = np.atleast_1d(x, f, x0)
-    xi = np.atleast_1d(*xi)
-    if not isinstance(xi, list):
-        xi = [xi, ]
+    xi = [np.atleast_1d(d) for d in xi]
+    for d in xi:
+        _assert(
+            d.shape == x0.shape,
+            "Derivative arrays must have the same shape as x0."
+        )
+
     num_derivatives = len(xi)  # num_derivatives = number of derivatives
-    nmax = np.ceil((xo.ptp()) * 10 ** (7. / max(num_derivatives, 1)))
-    xo, fo = trangood(xo, fo, min_x=min(x0), max_x=max(x0), max_n=nmax)
+    _assert(num_derivatives <= 4, "At most four derivatives are supported.")
 
-    n = f.shape[0]
+    nmax = np.ceil((np.ptp(xo)) * 10 ** (7. / max(num_derivatives, 1)))
+    xo, fo = trangood(xo, fo, min_x=np.min(x0), max_x=np.max(x0), max_n=nmax)
 
-    xu = (n - 1) * (x0 - xo[0]) / (xo[-1] - xo[0])
+    n = fo.shape[0]
 
-    fi = np.asarray(np.floor(xu), dtype=int)
-    fi = np.where(fi == n - 1, fi - 1, fi)
+    grid_scale = (n - 1) / (xo[-1] - xo[0])
+    xu = grid_scale * (x0 - xo[0])
+
+    fi = np.floor(xu).astype(int)
+    fi = np.clip(fi, 0, n - 2)
 
     xu = xu - fi
     y0 = fo[fi] + (fo[fi + 1] - fo[fi]) * xu
 
     y = y0
-    if num_derivatives > 4:
-        warnings.warn('Transformation of derivatives of order>4 is ' +
-                      'not supported.')
-        num_derivatives = 4
+
     if num_derivatives > 0:
         y = [y0]
         fxder = _diff(xo, fo, x0, num_derivatives)
@@ -2729,21 +3214,21 @@ def tranproc(x, f, x0, *xi):
     return y
 
 
-# pylint: disable=redefined-builtin
-def good_bins(data=None, range=None, num_bins=None, odd=False, loose=True):  # @ReservedAssignment
-    ''' Return good bins for histogram
+def good_bins(data=None, limits=None, num_bins=None, odd=False, loose=True):
+    """ Return good bins for histogram
 
     Parameters
     ----------
     data : array-like
         the data
-    range : (float, float)
-        minimum and maximum range of bins (default data.min(), data.max())
+    limits : (float, float)
+        minimum and maximum range of bins (default np.min(data), np.max(data))
     num_bins : scalar integer
         approximate number of bins wanted
         (default depending on num_data=len(data))
-    odd : bool
-        placement of bins (0 or 1) (default 0)
+    odd : bool, optional
+        If True, shift bin edges by half a bin width so that
+        bin centers fall on round values. (default False)
     loose : bool
         if True add extra space to min and max
         if False the bins are made tight to the min and max
@@ -2751,96 +3236,113 @@ def good_bins(data=None, range=None, num_bins=None, odd=False, loose=True):  # @
     Examples
     --------
     >>> import wafo.misc as wm
-    >>> np.allclose(wm.good_bins(range=(0,5), num_bins=6),
+    >>> np.allclose(wm.good_bins(limits=(0,5), num_bins=6),
     ...             [-1.,  0.,  1.,  2.,  3.,  4.,  5.,  6.])
     True
-    >>> np.allclose(wm.good_bins(range=(0,5), num_bins=6, loose=False),
+    >>> np.allclose(wm.good_bins(limits=(0,5), num_bins=6, loose=False),
     ...             [ 0.,  1.,  2.,  3.,  4.,  5.])
     True
-    >>> np.allclose(wm.good_bins(range=(0,5), num_bins=6, odd=True),
+    >>> np.allclose(wm.good_bins(limits=(0,5), num_bins=6, odd=True),
     ...            [-1.5, -0.5,  0.5,  1.5,  2.5,  3.5,  4.5,  5.5,  6.5])
     True
-    >>> np.allclose(wm.good_bins(range=(0,5), num_bins=6, odd=True, loose=False),
+    >>> np.allclose(wm.good_bins(limits=(0,5), num_bins=6, odd=True, loose=False),
     ...             [-0.5,  0.5,  1.5,  2.5,  3.5,  4.5,  5.5])
     True
-    '''
-    def _default_range(range_, x):
-        return range_ if range_ else (x.min(), x.max())
+    """
+    def _default_limits(limits, x):
+        return limits if limits is not None else (np.min(x), np.max(x))
 
     def _default_bins(num_bins, x):
         if num_bins is None:
+            _assert(
+                x is not None,
+                "num_bins must be specified when data is not provided."
+            )
             num_bins = int(np.ceil(4 * np.sqrt(np.sqrt(len(x)))))
         return num_bins
 
     def _default_step(mn, mx, num_bins):
+        # Start with an approximate bin width and round
+        # it to a "nice" decimal value.
         d = float(mx - mn) / num_bins * 2
-        e = np.floor(np.log(d) / np.log(10))
-        m = np.clip(np.floor(d / 10 ** e), a_min=0, a_max=5)
-        if 2 < m < 5:
-            m = 2
-        return m * 10 ** e
+        e = np.floor(np.log10(d))
+        mantissa = int(np.floor(d / 10 ** e))
+        mantissa = np.clip(mantissa, a_min=0, a_max=5)
+        if 2 < mantissa < 5:
+            mantissa = 2
+        return mantissa * 10 ** e
+
+    _assert(
+        limits is not None or data is not None,
+        "Either data or limits must be specified."
+    )
 
     if data is not None:
         data = np.atleast_1d(data)
+        _assert(data.size > 0, "data must not be empty.")
 
-    mn, mx = _default_range(range, data)
-    num_bins = _default_bins(num_bins, data)
+    mn, mx = _default_limits(limits, data)
+    _assert(mx > mn, "limits must define a positive range.")
+    num_bins = int(_default_bins(num_bins, data))
+    _assert(num_bins > 0, "num_bins must be positive.")
     d = _default_step(mn, mx, num_bins)
+
+    # Shift edges by half a bin so that
+    # bin centers fall on round values.
     mn = (np.floor(mn / d) - loose) * d - odd * d / 2
     mx = (np.ceil(mx / d) + loose) * d + odd * d / 2
     limits = np.arange(mn, mx + d / 2, d)
     return limits
 
 
-def _make_bars(limits, bin_):
-    limits.shape = (-1, 1)
-    xx = limits.repeat(3, axis=1)
-    xx.shape = (-1,)
-    xx = xx[1:-1]
-    bin_.shape = (-1, 1)
-    yy = bin_.repeat(3, axis=1)
+def _make_bars(edges, counts):
+    edges = np.asarray(edges).reshape(-1, 1)
+    counts = np.asarray(counts).reshape(-1, 1)
+    
+    xx = edges.repeat(3, axis=1).ravel()[1:-1]
+    
+    yy = counts.repeat(3, axis=1)
     # yy[0,0] = 0.0 # pdf
     yy[:, 0] = 0.0  # histogram
-    yy.shape = (-1,)
-    yy = np.hstack((yy, 0.0))
+    yy = np.hstack((yy.ravel(), 0.0))
     return xx, yy
 
 
-# pylint: disable=redefined-builtin
-def _histogram(data, bins=None, range=None, density=False, weights=None):  # @ReservedAssignment
+def _histogram(data, bins=None, limits=None, density=False, weights=None):
 
     """
     Examples
     --------
     >>> import numpy as np
     >>> data = np.linspace(0, 10)
-    >>> xx, yy, limits = _histogram(data)
-    >>> len(limits)
+    >>> xx, yy, edges = _histogram(data)
+    >>> len(edges)
     12
-    >>> xx, yy, limits = _histogram(data, bins=[0, 5, 11])
+    >>> xx, yy, edges = _histogram(data, bins=[0, 5, 11])
     >>> np.allclose(xx, [ 0,  0,  5,  5,  5, 11, 11])
     True
     >>> np.allclose(yy, [  0.,  25.,  25.,   0.,  25.,  25.,   0.])
     True
-    >>> np.allclose(limits, [[ 0], [ 5], [11]])
+    >>> np.allclose(edges, [ 0, 5, 11])
     True
 
     """
     x = np.atleast_1d(data)
+    _assert(x.size > 0, "data must not be empty.")
     if bins is None:
         bins = int(np.ceil(4 * np.sqrt(np.sqrt(len(x)))))
-    bin_, limits = np.histogram(data,
-                                bins=bins,
-                                range=range,
-                                weights=weights,
-                                density=density)
-    xx, yy = _make_bars(limits, bin_)
-    return xx, yy, limits
+    counts, edges = np.histogram(data,
+                                 bins=bins,
+                                 range=limits,
+                                 weights=weights,
+                                 density=density)
+    xx, yy = _make_bars(edges, counts)
+    return xx, yy, edges
 
 
-def plot_histgrm(data, bins=None, range=None,  # @ReservedAssignment
-                 density=False, weights=None, lintype='b-'):
-    '''
+def plot_histgrm(data, bins=None, limits=None,
+                 density=False, weights=None, linetype='b-'):
+    """
     Plot histogram
 
     Parameters
@@ -2852,8 +3354,8 @@ def plot_histgrm(data, bins=None, range=None,  # @ReservedAssignment
         bins in the given range (4 * sqrt(sqrt(len(data)), by default).
         If a sequence, it defines the bin edges, including the
         rightmost edge, allowing for non-uniform bin widths.
-    range : (float, float), optional
-        The lower and upper range of the bins.  If not provided, range
+    limits : (float, float), optional
+        The lower and upper limit of the bins.  If not provided, limits
         is simply ``(data.min(), data.max())``.  Values outside the range are
         ignored.
     density : bool, optional
@@ -2865,7 +3367,8 @@ def plot_histgrm(data, bins=None, range=None,  # @ReservedAssignment
         only contributes its associated weight towards the bin count
         (instead of 1).  If `normed` is True, the weights are normalized,
         so that the integral of the density over the range remains 1
-    lintype : specify color and lintype, see PLOT for possibilities.
+    linetype : str, optional
+        Line style passed to matplotlib.pyplot.plot.
 
     Returns
     -------
@@ -2892,15 +3395,43 @@ def plot_histgrm(data, bins=None, range=None,  # @ReservedAssignment
     --------
     wafo.misc.good_bins
     numpy.histogram
-    '''
+    """
 
-    xx, yy, limits = _histogram(data, bins, range, density, weights)
-    return plt.plot(xx, yy, lintype, limits, limits * 0)
+    xx, yy, edges = _histogram(data, bins, limits, density, weights)
+    baseline = np.zeros_like(edges)
+    return plt.plot(xx, yy, linetype, edges, baseline)
 
 
 def num2pistr(x, n=3, numerator_max=10, denominator_max=10):
-    r'''
-    Convert a scalar to a text string in fractions of pi.
+    r"""
+    Convert a scalar to a string representation in fractions of pi.
+
+    Parameters
+    ----------
+    x : float
+        Value to convert.
+    n : int, optional
+        Number of significant digits used when `x` cannot be
+        represented as a simple fraction of pi. Default is 3.
+    numerator_max : int, optional
+        Maximum absolute numerator allowed in the pi-fraction
+        representation. If exceeded, a numeric string is returned.
+        Default is 10.
+    denominator_max : int, optional
+        Maximum absolute denominator allowed in the pi-fraction
+        representation. If exceeded, a numeric string is returned.
+        Default is 10.
+
+    Returns
+    -------
+    str
+        String representation of `x`, either as a fraction of pi
+        or as a decimal number.
+
+    Notes
+    -----
+    Only fractions of pi whose numerator and denominator do not exceed
+    `numerator_max` and `denominator_max` are rendered symbolically.
 
     Examples
     --------
@@ -2913,30 +3444,40 @@ def num2pistr(x, n=3, numerator_max=10, denominator_max=10):
     True
     >>> wm.num2pistr(-1/4)=='-0.25'
     True
-    '''
+    >>> wm.num2pistr(np.pi * 11)=='34.6'
+    True
+    >>> wm.num2pistr(np.pi * 11, numerator_max=20)==r'11\pi'
+    True
+    """
     
     def _denominator_text(den):
-        return '' if abs(den) == 1 else f'/{den}'
+        return '' if den == 1 else f'/{den}'
 
     def _numerator_text(num):
-        if abs(num) == 1:
-            return '-' if num == -1 else ''
+        if num == 1:
+            return ''
+        if num == -1:
+            return '-'
         return f'{num:d}'
 
-    frac = fractions.Fraction(x / pi).limit_denominator()
+    if x == 0:
+        return "0"
+
+    frac = fractions.Fraction.from_float(x / np.pi).limit_denominator()
     num, den = frac.numerator, frac.denominator
 
-    if (abs(den) <= denominator_max and 
-        abs(num) <= numerator_max and 
-        num != 0):
+    if (
+        num != 0 
+        and abs(num) <= numerator_max
+        and abs(den) <= denominator_max 
+    ):
         return rf'{_numerator_text(num)}\pi{_denominator_text(den)}'
 
     return f'{x:.{n}g}'
 
 
-
 def fourier(data, t=None, period=None, m=None, method='trapezoid'):
-    '''
+    """
     Returns Fourier coefficients.
 
     Parameters
@@ -2954,8 +3495,12 @@ def fourier(data, t=None, period=None, m=None, method='trapezoid'):
 
     Returns
     -------
-    a,b  = Fourier coefficients size m x p
+    a, b : ndarray
+        Arrays of shape (m, p) containing cosine and sine
+        Fourier coefficients.
 
+    Notes
+    -----
     FOURIER finds the coefficients for a Fourier series representation
     of the signal x(t) (given in digital form).  It is assumed the signal
     is periodic over T.  N is the number of data points, and M-1 is the
@@ -2988,30 +3533,46 @@ def fourier(data, t=None, period=None, m=None, method='trapezoid'):
     See also
     --------
     fft
-    '''
+    """
     x = np.atleast_2d(data)
     p, n = x.shape
+
     t = np.arange(n) if t is None else np.atleast_1d(t)
 
-    n = len(t) if n is None else n
+    _assert(
+        len(t) == n,
+        "Length of t must match the last dimension of data."
+    )
+
     m = n if m is None else m
     period = t[-1] - t[0] if period is None else period
-    intfun = trapezoid if method.startswith('trap') else simpson
+
+    _assert(period > 0, "period must be positive.")
+
+    method = method.lower()
+    if method == "trapezoid":
+        intfun = trapezoid
+    elif method == "simpson":
+        intfun = simpson
+    else:
+        raise ValueError(
+            "method must be 'trapezoid' or 'simpson'"
+        )
 
     # Define the vectors for computing the Fourier coefficients
-    t.shape = (1, -1)
-    a = zeros((m, p))
-    b = zeros((m, p))
+    t = t.reshape(1, -1)
+    a = np.zeros((m, p))
+    b = np.zeros((m, p))
     a[0] = intfun(x, t, axis=-1)
 
     # Compute M-1 more coefficients
-    tmp = 2 * pi * t / period
+    tmp = 2 * np.pi * t / period
     for i in range(1, m):
-        a[i] = intfun(x * cos(i * tmp), t, axis=-1)
-        b[i] = intfun(x * sin(i * tmp), t, axis=-1)
+        a[i] = intfun(x * np.cos(i * tmp), t, axis=-1)
+        b[i] = intfun(x * np.sin(i * tmp), t, axis=-1)
 
-    a = a / pi
-    b = b / pi
+    a = a / np.pi
+    b = b / np.pi
 
     # Alternative:  faster for large M, but gives different results than above.
 #    nper = np.diff(t([1 end]))/period; # Number of periods given
@@ -3026,7 +3587,7 @@ def fourier(data, t=None, period=None, m=None, method='trapezoid'):
 #    Fcof1 = 2*ifft(x(1:N1,:),[],1);
 #    Pcor = [1; exp(sqrt(-1)*(1:M-1).'*t(1))] # correction term to get
 #                                             # the correct integration limits
-#    Fcof = Fcof1(1:M,:).*Pcor(:,ones(1,P));
+#    Fcof = Fcof1(1:M,:).*Pcor(:, np.ones(1,P));
 #    a = real(Fcof(1:M,:));
 #    b = imag(Fcof(1:M,:));
 
